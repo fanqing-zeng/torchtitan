@@ -34,6 +34,7 @@ def deepseek_v3_debugmodel_mtp_fsdp4_ep2_compile() -> Trainer.Config:
     config.override.imports = [
         "torchtitan.overrides.helion_rope.helion_cos_sin_rope",
         "torchtitan.overrides.helion_rope.helion_complex_rope",
+        "torchtitan.overrides.npu_flex_eager.npu_flex_eager",
     ]
     config.training.disable_cuda_graphs = True
     return config
@@ -48,6 +49,33 @@ def deepseek_v3_debugmodel_fsdp2_tp2_pp2_ep4() -> Trainer.Config:
     config.parallelism.tensor_parallel_degree = 2
     config.parallelism.expert_parallel_degree = 4
     config.training.disable_cuda_graphs = True
+    config.override.imports = ["torchtitan.overrides.npu_flex_eager.npu_flex_eager"]
+
+    return config
+
+
+def deepseek_v3_debugmodel_fsdp8_ep8() -> Trainer.Config:
+    config = deepseek_v3_debugmodel()
+    _use_spmd_types(config, typechecking=True)
+    config.parallelism.data_parallel_shard_degree = 8
+    config.parallelism.expert_parallel_degree = 8
+    config.training.disable_cuda_graphs = True
+    config.override.imports = ["torchtitan.overrides.npu_flex_eager.npu_flex_eager"]
+
+    return config
+
+
+def deepseek_v3_debugmodel_fsdp2_cp2_pp2_ep4() -> Trainer.Config:
+    config = deepseek_v3_debugmodel()
+    _use_spmd_types(config, typechecking=False)
+    config.parallelism.pipeline_parallel_degree = 2
+    config.parallelism.pipeline_parallel_schedule = "Interleaved1F1B"
+    config.parallelism.data_parallel_shard_degree = 2
+    config.parallelism.context_parallel_degree = 2
+    config.parallelism.expert_parallel_degree = 4
+    config.training.disable_cuda_graphs = True
+    config.override.imports = ["torchtitan.overrides.npu_flex_eager.npu_flex_eager"]
+
     return config
 
 
@@ -58,6 +86,8 @@ def deepseek_v3_debugmodel_hsdp2x2_ep2() -> Trainer.Config:
     config.parallelism.data_parallel_shard_degree = 2
     config.parallelism.expert_parallel_degree = 2
     config.training.disable_cuda_graphs = True
+    config.override.imports = ["torchtitan.overrides.npu_flex_eager.npu_flex_eager"]
+
     return config
 
 
@@ -67,6 +97,7 @@ def deepseek_v3_debugmodel_fused_mla_swiglu_fsdp4_ep2() -> Trainer.Config:
     config.override.imports = [
         "torchtitan.overrides.fused_mla.fused_mla",
         "torchtitan.overrides.fused_swiglu.fused_swiglu",
+        "torchtitan.overrides.npu_flex_eager.npu_flex_eager",
     ]
     config.parallelism.data_parallel_shard_degree = 4
     config.parallelism.expert_parallel_degree = 2
@@ -81,6 +112,21 @@ def qwen3_debugmodel_moe_param_groups_fsdp2_tp2_ep4() -> Trainer.Config:
     config.parallelism.tensor_parallel_degree = 2
     config.parallelism.expert_parallel_degree = 4
     config.training.disable_cuda_graphs = True
+    config.override.imports = ["torchtitan.overrides.npu_flex_eager.npu_flex_eager"]
+
+    return config
+
+
+def qwen3_debugmodel_moe_param_groups_fsdp2_tp2_cp2_ep8() -> Trainer.Config:
+    config = qwen3_debugmodel_moe_param_groups()
+    _use_spmd_types(config, typechecking=True)
+    config.parallelism.data_parallel_shard_degree = 2
+    config.parallelism.tensor_parallel_degree = 2
+    config.parallelism.context_parallel_degree = 2
+    config.parallelism.expert_parallel_degree = 8
+    config.training.disable_cuda_graphs = True
+    config.override.imports = ["torchtitan.overrides.npu_flex_eager.npu_flex_eager"]
+
     return config
 
 
@@ -129,6 +175,23 @@ def qwen35_debugmodel_moe_fsdp2_tp2_pp2_ep4() -> Trainer.Config:
     config.parallelism.expert_parallel_degree = 4
     _use_spmd_types(config, typechecking=False)
     config.training.disable_cuda_graphs = True
+    config.override.imports = ["torchtitan.overrides.npu_flex_eager.npu_flex_eager"]
+
+    return config
+
+
+def qwen35_debugmodel_moe_fsdp4_tp2_ep4() -> Trainer.Config:
+    from torchtitan.models.qwen3_5.config_registry import qwen35_debugmodel_moe
+
+    config = qwen35_debugmodel_moe()
+    config.parallelism.data_parallel_shard_degree = 4
+    config.parallelism.tensor_parallel_degree = 2
+    config.parallelism.pipeline_parallel_degree = 1
+    config.parallelism.expert_parallel_degree = 4
+    _use_spmd_types(config, typechecking=True)
+    config.training.disable_cuda_graphs = True
+    config.override.imports = ["torchtitan.overrides.npu_flex_eager.npu_flex_eager"]
+
     return config
 
 
@@ -155,6 +218,20 @@ def gpt_oss_debugmodel_fsdp4_tp2_ep4_compile() -> Trainer.Config:
     config.parallelism.expert_parallel_degree = 4
     config.compile.enable = True
     config.training.disable_cuda_graphs = True
+    config.override.imports = ["torchtitan.overrides.npu_flex_eager.npu_flex_eager"]
+
+    return config
+
+
+def gpt_oss_debugmodel_fsdp4_tp2_ep4() -> Trainer.Config:
+    config = gpt_oss_debugmodel()
+    _use_spmd_types(config, typechecking=False)
+    config.parallelism.data_parallel_shard_degree = 4
+    config.parallelism.tensor_parallel_degree = 2
+    config.parallelism.expert_parallel_degree = 4
+    config.training.disable_cuda_graphs = True
+    config.override.imports = ["torchtitan.overrides.npu_flex_eager.npu_flex_eager"]
+
     return config
 
 
@@ -170,6 +247,8 @@ def gpt_oss_debugmodel_flex_fsdp2_cp2_pp2_ep4_sac() -> Trainer.Config:
     config.parallelism.expert_parallel_degree = 4
     config.activation_checkpoint = SelectiveAC.Config()
     config.training.disable_cuda_graphs = True
+    config.override.imports = ["torchtitan.overrides.npu_flex_eager.npu_flex_eager"]
+
     return config
 
 
@@ -183,6 +262,8 @@ def gpt_oss_debugmodel_fsdp4_pp2_ep4_sac() -> Trainer.Config:
     config.parallelism.expert_parallel_degree = 4
     config.activation_checkpoint = SelectiveAC.Config()
     config.training.disable_cuda_graphs = True
+    config.override.imports = ["torchtitan.overrides.npu_flex_eager.npu_flex_eager"]
+
     return config
 
 
@@ -196,6 +277,8 @@ def kimi_k2_5_debugmodel_muon_fsdp4_ep2() -> Trainer.Config:
     config.parallelism.expert_parallel_degree = 2
     config.training.steps = 1
     config.training.disable_cuda_graphs = True
+    config.override.imports = ["torchtitan.overrides.npu_flex_eager.npu_flex_eager"]
+
     return config
 
 

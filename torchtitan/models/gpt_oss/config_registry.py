@@ -18,7 +18,7 @@ from torchtitan.trainer import Trainer
 from . import model_registry
 
 
-def _gpt_oss_debugmodel(attn_backend: str = "varlen") -> Trainer.Config:
+def _gpt_oss_debugmodel(attn_backend: str = "flex") -> Trainer.Config:
     model_spec = model_registry("debugmodel", attn_backend=attn_backend)
     return Trainer.Config(
         loss=ChunkedLossWrapper.Config(

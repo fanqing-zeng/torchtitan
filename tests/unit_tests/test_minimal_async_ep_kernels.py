@@ -21,6 +21,26 @@ from torchtitan.distributed.minimal_async_ep.kernels import (
     topk_scores_grad_kernel,
 )
 
+# The kernels are triton programs behind device-agnostic launchers, so the
+# tests run on any accelerator with a triton backend (NPU via triton-ascend).
+_DEVICE = "npu" if hasattr(torch, "npu") and torch.npu.is_available() else "cuda"
+
+if _DEVICE == "npu":
+
+    def _device_synchronize():
+        torch.npu.synchronize()
+
+    def _device_mem_get_info():
+        return torch.npu.mem_get_info()
+
+else:
+
+    def _device_synchronize():
+        torch.cuda.synchronize()
+
+    def _device_mem_get_info():
+        return torch.cuda.mem_get_info()
+
 
 def assert_equal(actual: torch.Tensor, expected: torch.Tensor) -> None:
     if actual.shape != expected.shape:
@@ -31,21 +51,23 @@ def assert_equal(actual: torch.Tensor, expected: torch.Tensor) -> None:
         raise AssertionError(f"tensor mismatch:\nactual={actual}\nexpected={expected}")
 
 
-@unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
+@unittest.skipUnless(
+    _DEVICE == "npu" or torch.cuda.is_available(), "CUDA or NPU required"
+)
 class TestMinimalAsyncEPKernels(unittest.TestCase):
     def test_topk_index_kernels_match_reference(self):
-        flat_indices = torch.tensor([2, 0, 3, 1], device="cuda", dtype=torch.int64)
+        flat_indices = torch.tensor([2, 0, 3, 1], device=_DEVICE, dtype=torch.int64)
         slot_to_row = invert_flat_indices_kernel(flat_indices, num_rows=4)
         assert_equal(
             slot_to_row,
-            torch.tensor([1, 3, 0, 2], device="cuda", dtype=torch.int64),
+            torch.tensor([1, 3, 0, 2], device=_DEVICE, dtype=torch.int64),
         )
 
         routed_output = torch.tensor(
             [[10.0, 1.0], [20.0, 2.0], [30.0, 3.0], [40.0, 4.0]],
-            device="cuda",
+            device=_DEVICE,
         )
-        scores = torch.tensor([0.1, 0.2, 0.3, 0.4], device="cuda")
+        scores = torch.tensor([0.1, 0.2, 0.3, 0.4], device=_DEVICE)
         out = reduce_topk_slots_kernel(
             routed_output,
             slot_to_row,
@@ -64,7 +86,7 @@ class TestMinimalAsyncEPKernels(unittest.TestCase):
         )
         assert_equal(out, expected_out)
 
-        grad_out = torch.tensor([[100.0, 10.0], [200.0, 20.0]], device="cuda")
+        grad_out = torch.tensor([[100.0, 10.0], [200.0, 20.0]], device=_DEVICE)
         grad_routed = expand_topk_grad_kernel(
             grad_out,
             flat_indices,
@@ -104,7 +126,7 @@ class TestMinimalAsyncEPKernels(unittest.TestCase):
         num_rows = first_overflow_row + 2
         num_tokens = (num_rows + top_k - 1) // top_k
 
-        free_bytes, _ = torch.cuda.mem_get_info()
+        free_bytes, _ = _device_mem_get_info()
         required_bytes = (
             (num_rows + num_tokens) * num_cols * 2 + num_rows * 8 + 512 * 1024**2
         )
@@ -116,10 +138,10 @@ class TestMinimalAsyncEPKernels(unittest.TestCase):
         grad_out = torch.ones(
             num_tokens,
             num_cols,
-            device="cuda",
+            device=_DEVICE,
             dtype=torch.bfloat16,
         )
-        flat_indices = torch.arange(num_rows, device="cuda", dtype=torch.int64)
+        flat_indices = torch.arange(num_rows, device=_DEVICE, dtype=torch.int64)
         grad_routed = expand_topk_grad_kernel(
             grad_out,
             flat_indices,
@@ -129,11 +151,11 @@ class TestMinimalAsyncEPKernels(unittest.TestCase):
         )
         rows = torch.tensor(
             [first_overflow_row - 1, first_overflow_row, num_rows - 1],
-            device="cuda",
+            device=_DEVICE,
         )
         assert_equal(
             grad_routed[rows, 0],
-            torch.ones(rows.numel(), device="cuda", dtype=torch.bfloat16),
+            torch.ones(rows.numel(), device=_DEVICE, dtype=torch.bfloat16),
         )
 
         grad_scores = topk_scores_grad_kernel(
@@ -149,7 +171,7 @@ class TestMinimalAsyncEPKernels(unittest.TestCase):
             torch.full(
                 (rows.numel(),),
                 num_cols,
-                device="cuda",
+                device=_DEVICE,
                 dtype=torch.float32,
             ),
         )
@@ -159,7 +181,7 @@ class TestMinimalAsyncEPKernels(unittest.TestCase):
         first_overflow_token = 2**31 // num_cols
         num_tokens = first_overflow_token + 2
 
-        free_bytes, _ = torch.cuda.mem_get_info()
+        free_bytes, _ = _device_mem_get_info()
         required_bytes = num_tokens * num_cols * 2 + num_tokens * 8 + 512 * 1024**2
         if free_bytes < required_bytes:
             self.skipTest(
@@ -169,10 +191,10 @@ class TestMinimalAsyncEPKernels(unittest.TestCase):
         routed_output = torch.ones(
             num_tokens,
             num_cols,
-            device="cuda",
+            device=_DEVICE,
             dtype=torch.uint8,
         )
-        slot_to_row = torch.arange(num_tokens, device="cuda", dtype=torch.int64)
+        slot_to_row = torch.arange(num_tokens, device=_DEVICE, dtype=torch.int64)
         out = reduce_topk_slots_kernel(
             routed_output,
             slot_to_row,
@@ -182,38 +204,38 @@ class TestMinimalAsyncEPKernels(unittest.TestCase):
         )
         tokens = torch.tensor(
             [first_overflow_token - 1, first_overflow_token, num_tokens - 1],
-            device="cuda",
+            device=_DEVICE,
         )
         assert_equal(
             out[tokens, 0],
-            torch.ones(tokens.numel(), device="cuda", dtype=torch.uint8),
+            torch.ones(tokens.numel(), device=_DEVICE, dtype=torch.uint8),
         )
 
     def test_metadata_kernels_match_reference(self):
         counts_storage = torch.tensor(
             [2, 1, 0, 0, 1, 0, 1, 0],
-            device="cuda",
+            device=_DEVICE,
             dtype=torch.int64,
         )
         counts = counts_storage[::2]
         local_count_starts = counts.cumsum(0) - counts
-        local_count_starts_storage = torch.empty(8, device="cuda", dtype=torch.int64)
+        local_count_starts_storage = torch.empty(8, device=_DEVICE, dtype=torch.int64)
         local_count_starts_storage[::2] = local_count_starts
         local_count_starts_storage[1::2] = torch.tensor(
             [1, 0, 0, 0],
-            device="cuda",
+            device=_DEVICE,
             dtype=torch.int64,
         )
         local_count_starts = local_count_starts_storage[::2]
-        local_dest_offsets_storage = torch.empty(8, device="cuda", dtype=torch.int64)
+        local_dest_offsets_storage = torch.empty(8, device=_DEVICE, dtype=torch.int64)
         local_dest_offsets_storage[::2] = torch.tensor(
             [0, 0, 5, 9],
-            device="cuda",
+            device=_DEVICE,
             dtype=torch.int64,
         )
         local_dest_offsets_storage[1::2] = torch.tensor(
             [7, 0, 0, 0],
-            device="cuda",
+            device=_DEVICE,
             dtype=torch.int64,
         )
         local_dest_offsets = local_dest_offsets_storage[::2]
@@ -230,42 +252,42 @@ class TestMinimalAsyncEPKernels(unittest.TestCase):
         )
         assert_equal(
             dst_ranks,
-            torch.tensor([0, 0, 1, 1], device="cuda", dtype=torch.int64),
+            torch.tensor([0, 0, 1, 1], device=_DEVICE, dtype=torch.int64),
         )
         assert_equal(
             dst_rows,
-            torch.tensor([0, 1, 5, 9], device="cuda", dtype=torch.int64),
+            torch.tensor([0, 1, 5, 9], device=_DEVICE, dtype=torch.int64),
         )
 
         segment_lens_storage = torch.tensor(
             [2, 1, 1, 0, 0, 0, 1, 0],
-            device="cuda",
+            device=_DEVICE,
             dtype=torch.int64,
         )
         segment_lens = segment_lens_storage[::2]
         output_starts_values = segment_lens.cumsum(0) - segment_lens
-        output_starts_storage = torch.empty(8, device="cuda", dtype=torch.int64)
+        output_starts_storage = torch.empty(8, device=_DEVICE, dtype=torch.int64)
         output_starts_storage[::2] = output_starts_values
         output_starts_storage[1::2] = torch.tensor(
             [3, 0, 0, 0],
-            device="cuda",
+            device=_DEVICE,
             dtype=torch.int64,
         )
         output_starts = output_starts_storage[::2]
         source_input_starts_storage = torch.empty(
             2,
             8,
-            device="cuda",
+            device=_DEVICE,
             dtype=torch.int64,
         )
         source_input_starts_storage[:, ::2] = torch.tensor(
             [[0, 0, 4, 6], [0, 0, 8, 10]],
-            device="cuda",
+            device=_DEVICE,
             dtype=torch.int64,
         )
         source_input_starts_storage[:, 1::2] = torch.tensor(
             [[99, 99, 99, 99], [99, 99, 99, 99]],
-            device="cuda",
+            device=_DEVICE,
             dtype=torch.int64,
         )
         source_input_starts = source_input_starts_storage[:, ::2]
@@ -284,26 +306,26 @@ class TestMinimalAsyncEPKernels(unittest.TestCase):
         )
         assert_equal(
             combine_ranks[:4],
-            torch.tensor([0, 0, 1, 1], device="cuda", dtype=torch.int64),
+            torch.tensor([0, 0, 1, 1], device=_DEVICE, dtype=torch.int64),
         )
         assert_equal(
             combine_rows[:4],
-            torch.tensor([4, 5, 8, 10], device="cuda", dtype=torch.int64),
+            torch.tensor([4, 5, 8, 10], device=_DEVICE, dtype=torch.int64),
         )
         assert_equal(
             num_valid_rows,
-            torch.tensor([4], device="cuda", dtype=torch.int64),
+            torch.tensor([4], device=_DEVICE, dtype=torch.int64),
         )
 
     def test_copy_kernels_handle_strides_and_active_row_masks(self):
-        counts = torch.tensor([2, 0, 1, 3], device="cuda", dtype=torch.int64)
+        counts = torch.tensor([2, 0, 1, 3], device=_DEVICE, dtype=torch.int64)
         count_dsts = [
-            torch.zeros(2, 4, device="cuda", dtype=torch.int64),
-            torch.zeros(2, 4, device="cuda", dtype=torch.int64),
+            torch.zeros(2, 4, device=_DEVICE, dtype=torch.int64),
+            torch.zeros(2, 4, device=_DEVICE, dtype=torch.int64),
         ]
         count_ptrs = torch.tensor(
             [dst.data_ptr() for dst in count_dsts],
-            device="cuda",
+            device=_DEVICE,
             dtype=torch.int64,
         )
         copy_full_counts_to_peers_kernel(
@@ -314,26 +336,26 @@ class TestMinimalAsyncEPKernels(unittest.TestCase):
             num_experts=4,
             dst_ptrs=count_ptrs,
         )
-        torch.cuda.synchronize()
+        _device_synchronize()
         for dst in count_dsts:
             assert_equal(dst[0], torch.zeros_like(counts))
             assert_equal(dst[1], counts)
 
-        src_base = torch.arange(20, device="cuda", dtype=torch.float32).view(5, 4)
+        src_base = torch.arange(20, device=_DEVICE, dtype=torch.float32).view(5, 4)
         src = src_base[:, ::2]
         row_dsts = [
-            torch.zeros(6, 2, device="cuda", dtype=torch.float32),
-            torch.zeros(6, 2, device="cuda", dtype=torch.float32),
+            torch.zeros(6, 2, device=_DEVICE, dtype=torch.float32),
+            torch.zeros(6, 2, device=_DEVICE, dtype=torch.float32),
         ]
         row_ptrs = torch.tensor(
             [dst.data_ptr() for dst in row_dsts],
-            device="cuda",
+            device=_DEVICE,
             dtype=torch.int64,
         )
-        dst_ranks = torch.tensor([1, 0, 1], device="cuda", dtype=torch.int64)
-        dst_rows = torch.tensor([3, 4, 5], device="cuda", dtype=torch.int64)
-        src_rows = torch.tensor([2, 0, 4], device="cuda", dtype=torch.int64)
-        num_valid_rows = torch.tensor([2], device="cuda", dtype=torch.int64)
+        dst_ranks = torch.tensor([1, 0, 1], device=_DEVICE, dtype=torch.int64)
+        dst_rows = torch.tensor([3, 4, 5], device=_DEVICE, dtype=torch.int64)
+        src_rows = torch.tensor([2, 0, 4], device=_DEVICE, dtype=torch.int64)
+        num_valid_rows = torch.tensor([2], device=_DEVICE, dtype=torch.int64)
 
         copy_rows_to_peers_kernel(
             src,
@@ -348,10 +370,10 @@ class TestMinimalAsyncEPKernels(unittest.TestCase):
             src_rows=src_rows,
             num_valid_rows=num_valid_rows,
         )
-        torch.cuda.synchronize()
+        _device_synchronize()
         assert_equal(row_dsts[1][3], src[2])
         assert_equal(row_dsts[0][4], src[0])
-        assert_equal(row_dsts[1][5], torch.zeros(2, device="cuda"))
+        assert_equal(row_dsts[1][5], torch.zeros(2, device=_DEVICE))
 
     def test_copy_rows_uses_int64_for_source_stride_arithmetic(self):
         row = 1_048_576
@@ -361,27 +383,27 @@ class TestMinimalAsyncEPKernels(unittest.TestCase):
         storage_numel = base_offset + high_offset + 1
         metadata_numel = row + 1
 
-        free_bytes, _ = torch.cuda.mem_get_info()
+        free_bytes, _ = _device_mem_get_info()
         required_bytes = storage_numel + metadata_numel * 8 * 2 + 512 * 1024**2
         if free_bytes < required_bytes:
             self.skipTest(
                 f"need at least {required_bytes} free CUDA bytes, got {free_bytes}"
             )
 
-        src_storage = torch.empty(storage_numel, device="cuda", dtype=torch.uint8)
+        src_storage = torch.empty(storage_numel, device=_DEVICE, dtype=torch.uint8)
         src = src_storage[base_offset:]
-        dst = torch.zeros(1, device="cuda", dtype=torch.uint8)
-        dst_ptrs = torch.tensor([dst.data_ptr()], device="cuda", dtype=torch.int64)
-        dst_ranks = torch.full((metadata_numel,), -1, device="cuda", dtype=torch.int64)
+        dst = torch.zeros(1, device=_DEVICE, dtype=torch.uint8)
+        dst_ptrs = torch.tensor([dst.data_ptr()], device=_DEVICE, dtype=torch.int64)
+        dst_ranks = torch.full((metadata_numel,), -1, device=_DEVICE, dtype=torch.int64)
         dst_ranks[row] = 0
-        dst_rows = torch.zeros(metadata_numel, device="cuda", dtype=torch.int64)
+        dst_rows = torch.zeros(metadata_numel, device=_DEVICE, dtype=torch.int64)
         num_valid_rows = torch.tensor(
-            [metadata_numel], device="cuda", dtype=torch.int64
+            [metadata_numel], device=_DEVICE, dtype=torch.int64
         )
 
         src_storage[0] = 17
         src_storage[base_offset + high_offset] = 93
-        torch.cuda.synchronize()
+        _device_synchronize()
 
         _copy_rows_to_peer_ptrs_kernel[(metadata_numel, 1)](
             src,
@@ -401,7 +423,7 @@ class TestMinimalAsyncEPKernels(unittest.TestCase):
             BLOCK_M=1,
             BLOCK_N=1,
         )
-        torch.cuda.synchronize()
+        _device_synchronize()
 
         self.assertEqual(int(dst.item()), 93)
 

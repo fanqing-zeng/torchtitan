@@ -35,6 +35,18 @@ def build_model_tests_list() -> list[OverrideDefinitions]:
             ngpu=8,
         ),
         OverrideDefinitions(
+            configs=[recipes.deepseek_v3_debugmodel_fsdp8_ep8],
+            test_descr="DeepSeek V3 FSDP+EP",
+            test_name="deepseek_v3_fsdp+ep",
+            ngpu=8,
+        ),
+        OverrideDefinitions(
+            configs=[recipes.deepseek_v3_debugmodel_fsdp2_cp2_pp2_ep4],
+            test_descr="DeepSeek V3 FSDP+CP+PP+EP",
+            test_name="deepseek_v3_fsdp+cp+pp+ep",
+            ngpu=8,
+        ),
+        OverrideDefinitions(
             configs=[recipes.deepseek_v3_debugmodel_hsdp2x2_ep2],
             test_descr="DeepSeek V3 HSDP+EP",
             test_name="deepseek_v3_hsdp+ep",
@@ -53,6 +65,12 @@ def build_model_tests_list() -> list[OverrideDefinitions]:
             test_descr="Qwen3 MoE FSDP+TP+EP (param groups)",
             test_name="qwen3_moe_fsdp+tp+ep_param_groups",
             ngpu=4,
+        ),
+        OverrideDefinitions(
+            configs=[recipes.qwen3_debugmodel_moe_param_groups_fsdp2_tp2_cp2_ep8],
+            test_descr="Qwen3 MoE FSDP+TP+CP+EP (param groups)",
+            test_name="qwen3_moe_fsdp+tp+cp+ep_param_groups",
+            ngpu=8,
         ),
         OverrideDefinitions(
             configs=[
@@ -89,6 +107,12 @@ def build_model_tests_list() -> list[OverrideDefinitions]:
             ngpu=8,
         ),
         OverrideDefinitions(
+            configs=[recipes.qwen35_debugmodel_moe_fsdp4_tp2_ep4],
+            test_descr="Qwen3.5 MoE FSDP+TP+EP",
+            test_name="qwen3_5_moe_fsdp+tp+ep",
+            ngpu=8,
+        ),
+        OverrideDefinitions(
             configs=[recipes.qwen35_debugmodel_varlen_attn_fsdp2_tp2_sac],
             test_descr="Qwen3.5 FSDP+TP+VARLEN_ATTN + per op SAC",
             test_name="qwen3_5_fsdp+tp+varlen_attn+per_op_sac",
@@ -100,6 +124,12 @@ def build_model_tests_list() -> list[OverrideDefinitions]:
             configs=[recipes.gpt_oss_debugmodel_fsdp4_tp2_ep4_compile],
             test_descr="Gpt-oss FSDP+TP+EP+compile",
             test_name="gpt_oss_fsdp+tp+ep+compile",
+            ngpu=8,
+        ),
+        OverrideDefinitions(
+            configs=[recipes.gpt_oss_debugmodel_fsdp4_tp2_ep4],
+            test_descr="Gpt-oss FSDP+TP+EP",
+            test_name="gpt_oss_fsdp+tp+ep",
             ngpu=8,
         ),
         OverrideDefinitions(

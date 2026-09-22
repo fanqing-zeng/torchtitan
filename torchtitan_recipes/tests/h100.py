@@ -72,6 +72,8 @@ def deepseek_v3_debugmodel_minimal_async_ep_fsdp2_tp2_cp2_ep8() -> Trainer.Confi
     config.parallelism.tensor_parallel_degree = 2
     config.parallelism.expert_parallel_degree = 8
     config.activation_checkpoint = FullAC.Config()
+    config.override.imports = ["torchtitan.overrides.npu_flex_eager.npu_flex_eager"]
+
     return config
 
 
@@ -81,4 +83,17 @@ def deepseek_v3_debugmodel_hybridep_fsdp4_ep2_compile() -> Trainer.Config:
     config.parallelism.expert_parallel_degree = 2
     config.compile.enable = True
     config.compile.components = ["model", "loss"]
+    config.override.imports = ["torchtitan.overrides.npu_flex_eager.npu_flex_eager"]
+
+    return config
+
+
+def qwen3_moe_deepep_fsdp4_ep4() -> Trainer.Config:
+    from torchtitan.models.qwen3.config_registry import qwen3_moe_deepep
+
+    config = qwen3_moe_deepep()
+    config.parallelism.data_parallel_shard_degree = 4
+    config.parallelism.expert_parallel_degree = 4
+    config.override.imports = ["torchtitan.overrides.npu_flex_eager.npu_flex_eager"]
+
     return config

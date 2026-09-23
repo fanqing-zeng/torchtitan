@@ -26,6 +26,8 @@ is an identity transform kept only so the module can be listed in
     torchtitan_train ... --override.imports torchtitan.overrides.npu_flex_eager.npu_flex_eager
 """
 
+import importlib
+
 import torch
 
 from torchtitan.config import override
@@ -53,6 +55,25 @@ if _on_npu():
     # Mask construction also compiles under torch.compile and can hit the
     # broken inductor paths (SIMT triton lowering); run it eager too.
     titan_attention._compiled_create_block_mask = create_block_mask
+    # Second mask-compile site: the shared vision encoder (used by the
+    # multimodal debugmodels, e.g. qwen3_5 / kimi_k2_5 / muse_glimmer) has its
+    # own compiled wrapper, and the per-model vision encoders re-export it via
+    # from-imports -- so every holding module must be rebound, not just the
+    # defining one.
+    from torchtitan.models.common import vision_encoder as titan_vision_encoder
+
+    titan_vision_encoder.compiled_create_block_mask = create_block_mask
+    for module_name in (
+        "torchtitan.models.qwen3_5.vision_encoder",
+        "torchtitan.models.kimi_k2_7.vision_encoder",
+        "torchtitan.models.muse_glimmer.vision_encoder",
+    ):
+        try:
+            module = importlib.import_module(module_name)
+        except ImportError:
+            continue
+        if hasattr(module, "compiled_create_block_mask"):
+            module.compiled_create_block_mask = create_block_mask
 
     # torch_npu's repeat_interleave_backward_tensor has no Meta kernel, which
     # aborts tracing under torch.compile. A backward op always returns the

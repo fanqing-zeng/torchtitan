@@ -177,6 +177,10 @@ def qwen35_debugmodel_moe_fsdp2_tp2_pp2_ep4() -> Trainer.Config:
     config.training.disable_cuda_graphs = True
     config.override.imports = ["torchtitan.overrides.npu_flex_eager.npu_flex_eager"]
 
+    # First-run FLA/TileLang kernel compile and autotune exceed the default
+    # 100s train timeout.
+    config.comm.train_timeout_seconds = 600
+
     return config
 
 

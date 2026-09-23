@@ -10,6 +10,7 @@ import torch
 import triton.language as tl
 
 from torchtitan.distributed.minimal_async_ep.kernels import (
+    _copy_rows_to_peer_direct_kernel,
     _copy_rows_to_peer_ptrs_kernel,
     copy_full_counts_to_peers_kernel,
     copy_rows_to_peers_kernel,
@@ -405,22 +406,30 @@ class TestMinimalAsyncEPKernels(unittest.TestCase):
         src_storage[base_offset + high_offset] = 93
         _device_synchronize()
 
-        _copy_rows_to_peer_ptrs_kernel[(metadata_numel, 1)](
+        # NPU adaptation: the pointer-table kernel requires an int-to-pointer
+        # conversion that triton-ascend 3.2.2 cannot lower (native abort), so
+        # exercise the same int64 source-stride arithmetic through the
+        # direct-pointer kernel instead.
+        _copy_rows_to_peer_direct_kernel[((metadata_numel + 31) // 32, 1)](
             src,
-            dst_ptrs,
+            dst,
             dst_ranks,
             dst_rows,
             num_valid_rows,
             dst_rows,
+            PEER_RANK=0,
             NUM_ROWS=metadata_numel,
             NUM_COLS=1,
             SRC_ROW_STRIDE=stride,
             SRC_COL_STRIDE=1,
             DST_ROW_STRIDE=1,
-            DST_DTYPE=tl.uint8,
             HAS_NUM_VALID_ROWS=True,
             HAS_SRC_ROWS=False,
-            BLOCK_M=1,
+            # BLOCK_M=32 keeps the row-grid dimension (cdiv(1048577, 32) =
+            # 32768) within the Ascend kernel-launch limit of 65535 programs
+            # per dimension; CUDA accepts the original BLOCK_M=1 million-row
+            # grid directly.
+            BLOCK_M=32,
             BLOCK_N=1,
         )
         _device_synchronize()

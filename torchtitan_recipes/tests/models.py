@@ -31,9 +31,10 @@ def deepseek_v3_debugmodel_mtp_fsdp4_ep2_compile() -> Trainer.Config:
     config.parallelism.data_parallel_shard_degree = 4
     config.parallelism.expert_parallel_degree = 2
     config.compile.enable = True
+    # NPU: compile the loss only (see gpt_oss compile recipe); the Helion
+    # fused RoPE kernels are CUDA-only and are dropped from the override set.
+    config.compile.components = ["loss"]
     config.override.imports = [
-        "torchtitan.overrides.helion_rope.helion_cos_sin_rope",
-        "torchtitan.overrides.helion_rope.helion_complex_rope",
         "torchtitan.overrides.npu_flex_eager.npu_flex_eager",
     ]
     config.training.disable_cuda_graphs = True
@@ -97,6 +98,7 @@ def deepseek_v3_debugmodel_fused_mla_swiglu_fsdp4_ep2() -> Trainer.Config:
     config.override.imports = [
         "torchtitan.overrides.fused_mla.fused_mla",
         "torchtitan.overrides.fused_swiglu.fused_swiglu",
+        "torchtitan.overrides.npu_fused_ops.npu_fused_ops",
         "torchtitan.overrides.npu_flex_eager.npu_flex_eager",
     ]
     config.parallelism.data_parallel_shard_degree = 4
@@ -221,6 +223,11 @@ def gpt_oss_debugmodel_fsdp4_tp2_ep4_compile() -> Trainer.Config:
     config.parallelism.tensor_parallel_degree = 2
     config.parallelism.expert_parallel_degree = 4
     config.compile.enable = True
+    # NPU: torch_npu's inductor flex-attention hop lowering is broken (its
+    # mask subgraph rejects aten.index), so the model cannot be compiled with
+    # FlexAttention eager-rebound into the graph. Compile the loss only; the
+    # compile pipeline itself is still exercised end to end.
+    config.compile.components = ["loss"]
     config.training.disable_cuda_graphs = True
     config.override.imports = ["torchtitan.overrides.npu_flex_eager.npu_flex_eager"]
 

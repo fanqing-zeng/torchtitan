@@ -61,6 +61,7 @@ class _MinimalAsyncEPBufferState:
     counts_recv_peer_buffers: list[torch.Tensor]
     counts_recv_peer_ptrs: torch.Tensor
     hidden_recv_buffer_index: int = 0
+    hccl_fallback: bool = False
 
 
 _buffer_state: _MinimalAsyncEPBufferState | None = None
@@ -220,67 +221,107 @@ def init_buffer(
         max_routed_tokens,
     )
     backend = symm_mem.get_backend(device)
-    if backend != "CUDA":
+    if backend not in ("CUDA", "NPUSHMEM"):
         raise RuntimeError(
             "MinimalAsyncEP custom all-to-allv requires the symmetric-memory CUDA "
-            f"backend, got {backend}."
+            f"or NPUSHMEM backend, got {backend}."
         )
 
+    # The NPUSHMEM backend needs group-info registration before allocation,
+    # and its runtime library (libshmem) may be absent from the container.
+    # Probe with a tiny allocation; when it fails, transport falls back to
+    # HCCL collectives over regular device memory (same synchronous-op
+    # semantics, no peer direct writes).
+    hccl_fallback = False
+    if backend == "NPUSHMEM":
+        try:
+            from torch.distributed._symmetric_memory import _SymmetricMemory
+            import torch.distributed.distributed_c10d as c10d
+
+            world = dist.group.WORLD
+            _SymmetricMemory.set_group_info(
+                world.group_name,
+                world.rank(),
+                world.size(),
+                c10d._get_default_store(),
+            )
+            symm_mem.empty(1, dtype=dtype, device=device)
+        except Exception as e:
+            logger.warning(
+                "MinimalAsyncEP: symmetric memory unavailable on "
+                f"{device.type} (backend {backend}: {e}); "
+                "falling back to HCCL collectives."
+            )
+            hccl_fallback = True
+
+    def _alloc_recv(shape):
+        if hccl_fallback:
+            return torch.empty(shape, dtype=dtype, device=device)
+        return symm_mem.empty(*shape, dtype=dtype, device=device)
+
     hidden_recv_buffers = [
-        symm_mem.empty(
-            max_routed_tokens,
-            hidden_dim,
-            dtype=dtype,
-            device=device,
-        )
+        _alloc_recv((max_routed_tokens, hidden_dim))
         for _ in range(_HIDDEN_RECV_BUFFER_COUNT)
     ]
-    counts_recv_buffer = symm_mem.empty(
-        group.size(),
-        num_experts,
-        dtype=torch.int64,
-        device=device,
-    )
-    hidden_recv_handles = [
-        symm_mem.rendezvous(hidden_recv_buffer, group)
-        for hidden_recv_buffer in hidden_recv_buffers
-    ]
-    counts_recv_handle = symm_mem.rendezvous(counts_recv_buffer, group)
-    hidden_recv_peer_buffers = [
-        [
-            hidden_recv_handle.get_buffer(
-                peer,
-                hidden_recv_buffer.shape,
-                hidden_recv_buffer.dtype,
-            )
-            for peer in range(group.size())
-        ]
-        for hidden_recv_buffer, hidden_recv_handle in zip(
-            hidden_recv_buffers,
-            hidden_recv_handles,
+    if hccl_fallback:
+        counts_recv_buffer = torch.empty(
+            group.size(), num_experts, dtype=torch.int64, device=device
         )
-    ]
-    hidden_recv_peer_ptrs = [
-        torch.tensor(
-            [peer_buffer.data_ptr() for peer_buffer in hidden_recv_peer_buffers],
+    else:
+        counts_recv_buffer = symm_mem.empty(
+            group.size(),
+            num_experts,
             dtype=torch.int64,
             device=device,
         )
-        for hidden_recv_peer_buffers in hidden_recv_peer_buffers
-    ]
-    counts_recv_peer_buffers = [
-        counts_recv_handle.get_buffer(
-            peer,
-            counts_recv_buffer.shape,
-            counts_recv_buffer.dtype,
+    if hccl_fallback:
+        hidden_recv_handles = [None] * _HIDDEN_RECV_BUFFER_COUNT
+        counts_recv_handle = None
+        hidden_recv_peer_buffers = [None] * _HIDDEN_RECV_BUFFER_COUNT
+        hidden_recv_peer_ptrs = [None] * _HIDDEN_RECV_BUFFER_COUNT
+        counts_recv_peer_buffers = None
+        counts_recv_peer_ptrs = None
+    else:
+        hidden_recv_handles = [
+            symm_mem.rendezvous(hidden_recv_buffer, group)
+            for hidden_recv_buffer in hidden_recv_buffers
+        ]
+        counts_recv_handle = symm_mem.rendezvous(counts_recv_buffer, group)
+        hidden_recv_peer_buffers = [
+            [
+                hidden_recv_handle.get_buffer(
+                    peer,
+                    hidden_recv_buffer.shape,
+                    hidden_recv_buffer.dtype,
+                )
+                for peer in range(group.size())
+            ]
+            for hidden_recv_buffer, hidden_recv_handle in zip(
+                hidden_recv_buffers,
+                hidden_recv_handles,
+            )
+        ]
+        hidden_recv_peer_ptrs = [
+            torch.tensor(
+                [peer_buffer.data_ptr() for peer_buffer in hidden_recv_peer_buffers],
+                dtype=torch.int64,
+                device=device,
+            )
+            for hidden_recv_peer_buffers in hidden_recv_peer_buffers
+        ]
+        counts_recv_peer_buffers = [
+            counts_recv_handle.get_buffer(
+                peer,
+                counts_recv_buffer.shape,
+                counts_recv_buffer.dtype,
+            )
+            for peer in range(group.size())
+        ]
+        counts_recv_peer_ptrs = torch.tensor(
+            [peer_buffer.data_ptr() for peer_buffer in counts_recv_peer_buffers],
+            dtype=torch.int64,
+            device=device,
         )
-        for peer in range(group.size())
-    ]
-    counts_recv_peer_ptrs = torch.tensor(
-        [peer_buffer.data_ptr() for peer_buffer in counts_recv_peer_buffers],
-        dtype=torch.int64,
-        device=device,
-    )
 
     _buffer_state = _MinimalAsyncEPBufferState(
         group=group,
@@ -293,6 +334,7 @@ def init_buffer(
         counts_recv_handle=counts_recv_handle,
         counts_recv_peer_buffers=counts_recv_peer_buffers,
         counts_recv_peer_ptrs=counts_recv_peer_ptrs,
+        hccl_fallback=hccl_fallback,
     )
     _buffer_key = buffer_key
 
@@ -322,6 +364,18 @@ def _copy_rows_to_peers_and_wait_cuda(
         _buffer_state.hidden_recv_buffer_index + 1
     ) % _HIDDEN_RECV_BUFFER_COUNT
     hidden_recv_buffer = _buffer_state.hidden_recv_buffers[buffer_index]
+
+    if _buffer_state.hccl_fallback:
+        return _alltoall_rows_hccl(
+            hidden_recv_buffer,
+            x,
+            dst_ranks,
+            dst_rows,
+            num_rows,
+            src_rows=src_rows,
+            num_valid_rows=num_valid_rows,
+        )
+
     hidden_recv_handle = _buffer_state.hidden_recv_handles[buffer_index]
     hidden_recv_peer_buffers = _buffer_state.hidden_recv_peer_buffers[buffer_index]
     hidden_recv_peer_ptrs = _buffer_state.hidden_recv_peer_ptrs[buffer_index]
@@ -342,6 +396,64 @@ def _copy_rows_to_peers_and_wait_cuda(
     )
     _wait_hidden_ready(hidden_recv_handle)
     return hidden_recv_buffer
+
+
+def _alltoall_rows_hccl(
+    recv_buffer: torch.Tensor,
+    x: torch.Tensor,
+    dst_ranks: torch.Tensor,
+    dst_rows: torch.Tensor,
+    num_rows: int,
+    *,
+    src_rows: torch.Tensor | None = None,
+    num_valid_rows: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """HCCL transport fallback for the symmetric-memory row copy.
+
+    Reproduces the peer-write semantics with collectives over regular device
+    memory: exchange per-peer counts, all-to-all the rows together with their
+    destination row indices (stable per-peer order), then scatter into the
+    expert-major receive layout with a local ``index_copy_``. Synchronous by
+    construction, matching the symmetric-memory path's op boundary.
+    """
+    group = _buffer_state.group
+    ep_size = group.size()
+    limit = num_rows if num_valid_rows is None else int(num_valid_rows.item())
+    ranks = dst_ranks[:limit]
+    rows = dst_rows[:limit]
+    if src_rows is not None:
+        x = x.index_select(0, src_rows[:limit])
+    else:
+        x = x[:limit]
+
+    send_counts = torch.bincount(ranks, minlength=ep_size)
+    send_counts_host = send_counts.tolist()
+    recv_counts = torch.empty(ep_size, dtype=torch.int64, device=x.device)
+    dist.all_to_all_single(recv_counts, send_counts, group=group)
+    recv_counts_host = recv_counts.tolist()
+
+    order = torch.argsort(ranks, stable=True)
+    send_x = x.index_select(0, order)
+    send_rows = rows.index_select(0, order)
+    total_recv = sum(recv_counts_host)
+    recv_x = x.new_empty((total_recv, x.shape[1]))
+    recv_rows = rows.new_empty(total_recv)
+    dist.all_to_all_single(
+        recv_x,
+        send_x,
+        output_split_sizes=recv_counts_host,
+        input_split_sizes=send_counts_host,
+        group=group,
+    )
+    dist.all_to_all_single(
+        recv_rows,
+        send_rows,
+        output_split_sizes=recv_counts_host,
+        input_split_sizes=send_counts_host,
+        group=group,
+    )
+    recv_buffer.index_copy_(0, recv_rows, recv_x)
+    return recv_buffer
 
 
 def _wait_hidden_ready(hidden_recv_handle: Any) -> None:
@@ -375,6 +487,15 @@ def _copy_all_counts_to_peers_and_wait_cuda(
     assert _buffer_state is not None
 
     num_experts = num_local_tokens_per_expert_E.numel()
+    if _buffer_state.hccl_fallback:
+        # Every peer writes its counts into row `peer_rank` of every buffer,
+        # which is exactly an all-gather over the EP group.
+        dist.all_gather_into_tensor(
+            _buffer_state.counts_recv_buffer,
+            num_local_tokens_per_expert_E.contiguous(),
+            group=_buffer_state.group,
+        )
+        return _buffer_state.counts_recv_buffer
     copy_full_counts_to_peers_kernel(
         num_local_tokens_per_expert_E,
         _buffer_state.counts_recv_peer_buffers,
@@ -557,12 +678,7 @@ def _dispatch_metadata(
     )
 
 
-@torch.library.custom_op(
-    "minimal_async_ep::dispatch",
-    mutates_args=(),
-    device_types="cuda",
-)
-def dispatch_op(
+def _dispatch_impl(
     dispatch_input: torch.Tensor,
     topk_expert_ids_TK: torch.Tensor,  # noqa: N803
     num_local_tokens_per_expert_E: torch.Tensor,  # noqa: N803
@@ -647,6 +763,40 @@ def dispatch_op(
     )
 
 
+
+
+
+@torch.library.custom_op(
+    "minimal_async_ep::dispatch",
+    mutates_args=(),
+    device_types="cuda",
+)
+def dispatch_op(
+    dispatch_input: torch.Tensor,
+    topk_expert_ids_TK: torch.Tensor,  # noqa: N803
+    num_local_tokens_per_expert_E: torch.Tensor,  # noqa: N803
+    receive_capacity: int,
+    ep_size: int,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    return _dispatch_impl(
+        dispatch_input,
+        topk_expert_ids_TK,
+        num_local_tokens_per_expert_E,
+        receive_capacity,
+        ep_size,
+    )
+
+
 @dispatch_op.register_fake
 def dispatch_op_fake(
     dispatch_input: torch.Tensor,
@@ -683,12 +833,7 @@ def dispatch_op_fake(
     )
 
 
-@torch.library.custom_op(
-    "minimal_async_ep::combine",
-    mutates_args=(),
-    device_types="cuda",
-)
-def combine_op(
+def _combine_impl(
     x: torch.Tensor,
     dispatch_dst_ranks: torch.Tensor,
     dispatch_dst_rows: torch.Tensor,
@@ -741,6 +886,42 @@ def combine_op(
     return out_TD, routed_output_ND
 
 
+
+
+
+@torch.library.custom_op(
+    "minimal_async_ep::combine",
+    mutates_args=(),
+    device_types="cuda",
+)
+def combine_op(
+    x: torch.Tensor,
+    dispatch_dst_ranks: torch.Tensor,
+    dispatch_dst_rows: torch.Tensor,
+    combine_dst_ranks: torch.Tensor,
+    combine_dst_rows: torch.Tensor,
+    combine_num_valid_rows: torch.Tensor,
+    T_row_to_E_row_N: torch.Tensor,  # noqa: N803
+    E_row_to_T_row_N: torch.Tensor,  # noqa: N803
+    routed_scores_N: torch.Tensor,  # noqa: N803
+    num_tokens: int,
+    top_k: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return _combine_impl(
+        x,
+        dispatch_dst_ranks,
+        dispatch_dst_rows,
+        combine_dst_ranks,
+        combine_dst_rows,
+        combine_num_valid_rows,
+        T_row_to_E_row_N,
+        E_row_to_T_row_N,
+        routed_scores_N,
+        num_tokens,
+        top_k,
+    )
+
+
 @combine_op.register_fake
 def combine_op_fake(
     x: torch.Tensor,
@@ -764,12 +945,7 @@ def combine_op_fake(
     )
 
 
-@torch.library.custom_op(
-    "minimal_async_ep::dispatch_backward",
-    mutates_args=(),
-    device_types="cuda",
-)
-def dispatch_backward_op(
+def _dispatch_backward_impl(
     grad_hidden: torch.Tensor,
     combine_dst_ranks: torch.Tensor,
     combine_dst_rows: torch.Tensor,
@@ -811,6 +987,36 @@ def dispatch_backward_op(
     )
 
 
+
+
+
+@torch.library.custom_op(
+    "minimal_async_ep::dispatch_backward",
+    mutates_args=(),
+    device_types="cuda",
+)
+def dispatch_backward_op(
+    grad_hidden: torch.Tensor,
+    combine_dst_ranks: torch.Tensor,
+    combine_dst_rows: torch.Tensor,
+    combine_num_valid_rows: torch.Tensor,
+    T_row_to_E_row_N: torch.Tensor,  # noqa: N803
+    num_routed_rows: int,
+    num_tokens: int,
+    top_k: int,
+) -> torch.Tensor:
+    return _dispatch_backward_impl(
+        grad_hidden,
+        combine_dst_ranks,
+        combine_dst_rows,
+        combine_num_valid_rows,
+        T_row_to_E_row_N,
+        num_routed_rows,
+        num_tokens,
+        top_k,
+    )
+
+
 @dispatch_backward_op.register_fake
 def dispatch_backward_op_fake(
     grad_hidden: torch.Tensor,
@@ -825,12 +1031,7 @@ def dispatch_backward_op_fake(
     return grad_hidden.new_empty(num_tokens, grad_hidden.shape[1])
 
 
-@torch.library.custom_op(
-    "minimal_async_ep::combine_backward",
-    mutates_args=(),
-    device_types="cuda",
-)
-def combine_backward_op(
+def _combine_backward_impl(
     grad_out: torch.Tensor,
     dispatch_dst_ranks: torch.Tensor,
     dispatch_dst_rows: torch.Tensor,
@@ -882,6 +1083,36 @@ def combine_backward_op(
         E_row_to_T_row_N.numel(),
     )
     return grad_x, grad_scores
+
+
+
+
+
+@torch.library.custom_op(
+    "minimal_async_ep::combine_backward",
+    mutates_args=(),
+    device_types="cuda",
+)
+def combine_backward_op(
+    grad_out: torch.Tensor,
+    dispatch_dst_ranks: torch.Tensor,
+    dispatch_dst_rows: torch.Tensor,
+    E_row_to_T_row_N: torch.Tensor,  # noqa: N803
+    routed_scores_N: torch.Tensor,  # noqa: N803
+    saved_routed_output_ND: torch.Tensor,  # noqa: N803
+    top_k: int,
+    receive_capacity: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return _combine_backward_impl(
+        grad_out,
+        dispatch_dst_ranks,
+        dispatch_dst_rows,
+        E_row_to_T_row_N,
+        routed_scores_N,
+        saved_routed_output_ND,
+        top_k,
+        receive_capacity,
+    )
 
 
 @combine_backward_op.register_fake
@@ -1006,6 +1237,14 @@ def combine_autograd_backward(ctx, grad_out, grad_routed_output):
         None,
     )
 
+
+# Ascend NPU: the custom ops are transport wrappers around plain PyTorch +
+# collectives; the same implementations run on NPU once the kernels below (and
+# the HCCL fallback transports) are registered. Inert on CUDA.
+dispatch_op.register_kernel("npu", _dispatch_impl)
+combine_op.register_kernel("npu", _combine_impl)
+dispatch_backward_op.register_kernel("npu", _dispatch_backward_impl)
+combine_backward_op.register_kernel("npu", _combine_backward_impl)
 
 dispatch_op.register_autograd(
     dispatch_autograd_backward,

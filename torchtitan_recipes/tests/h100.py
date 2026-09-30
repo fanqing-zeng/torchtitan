@@ -82,7 +82,9 @@ def deepseek_v3_debugmodel_hybridep_fsdp4_ep2_compile() -> Trainer.Config:
     config.parallelism.data_parallel_shard_degree = 4
     config.parallelism.expert_parallel_degree = 2
     config.compile.enable = True
-    config.compile.components = ["model", "loss"]
+    # NPU: compile the loss only (the model contains the broken torch_npu
+    # inductor flex hop lowering; see the gpt_oss compile recipe note).
+    config.compile.components = ["loss"]
     config.override.imports = ["torchtitan.overrides.npu_flex_eager.npu_flex_eager"]
 
     return config

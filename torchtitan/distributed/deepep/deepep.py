@@ -5,16 +5,16 @@
 # LICENSE file in the root directory of this source tree.
 
 """
-DeepEP v2 primitives for MoE Expert Parallel, on the unified ``ElasticBuffer`` API.
+DeepEP v2.5+ primitives for MoE Expert Parallel, on the unified ``EPBuffer`` API.
 
-DeepEP v2 (>= 2.0.0) collapses the v1 two-path design -- high-throughput (HT,
-``buffer.dispatch``/``combine``) and low-latency (LL,
-``buffer.low_latency_dispatch``/``combine``) -- into a SINGLE ``dispatch``/``combine``
-on ``deep_ep.ElasticBuffer``. There is one buffer, one pair of custom ops, and one
-``DispatchState`` for both modes; only ``dispatch`` branches. The branch is chosen at
-runtime by the GRAD context, not by prefill-vs-decode: ``dispatch_tokens`` forces the
-compact path whenever ``torch.is_grad_enabled()`` (training), so the expand path is taken
-only by an inference forward (no grad) that also set ``cudagraphable=True`` -- which covers
+DeepEP v2.5 splits the former single ``ElasticBuffer`` (v2.0-2.4) into
+``EPBuffer``/``EngramBuffer``/``PPBuffer``/``BucketBuffer``; expert-parallel MoE
+dispatch/combine lives on ``EPBuffer``. The API keeps ONE buffer, ONE pair of
+``dispatch``/``combine`` calls, and one ``EPHandle`` for both modes; only
+``dispatch`` branches. The branch is chosen at runtime by the GRAD context, not
+by prefill-vs-decode: ``dispatch_tokens`` forces the compact path whenever
+``torch.is_grad_enabled()`` (training), so the expand path is taken only by an
+inference forward (no grad) that also set ``cudagraphable=True`` -- which covers
 BOTH prefill and decode. Combine is handle-driven and mode-agnostic.
 
 - training (``cudagraphable=False``, the default; also forced under autograd): ``do_expand=False`` +
@@ -42,17 +42,17 @@ import torch
 from torch.distributed import ProcessGroup
 
 try:
-    from deep_ep import ElasticBuffer
+    from deep_ep import EPBuffer
 except ImportError as e:
     raise ImportError(
-        "DeepEP v2 (>= 2.0.0, ElasticBuffer) is required for this module. "
+        "DeepEP v2.5 (>= 2.5.0, EPBuffer) is required for this module. "
         "Install from: https://github.com/deepseek-ai/DeepEP"
     ) from e
 
 
 # Global buffer (single buffer per process, recreated if the group changes or a
-# larger size is needed). v2 uses ONE ElasticBuffer for both training and inference.
-_buffer: ElasticBuffer | None = None
+# larger size is needed). One EPBuffer serves both training and inference.
+_buffer: EPBuffer | None = None
 
 # Global cache for dispatch handles (EPHandle objects), keyed by an int handle_id.
 # The torch.library custom ops can only pass tensors across the op boundary, so we
@@ -78,7 +78,7 @@ def _get_next_handle_id() -> torch.Tensor:
 # Custom Op Registration for SAC Integration + autograd
 # ============================================================================
 #
-# ElasticBuffer.dispatch/combine are not autograd-aware. We wrap them in
+# EPBuffer.dispatch/combine are not autograd-aware. We wrap them in
 # torch.library custom ops so (a) SAC saves the comm outputs instead of recomputing
 # them and (b) we attach manual backward: dispatch backward is a combine and combine
 # backward is a dispatch (the DeepEP forward/backward duality). The opaque EPHandle
@@ -255,7 +255,7 @@ def _combine_op_impl(
     # dispatch setup_context never fires to free the handle, so pop it here. When a backward
     # will run (training), keep it: _combine_setup_context pops it for combine-backward.
     # ``will_backward`` is the caller's OUTER grad state -- inside this forward impl
-    # torch.is_grad_enabled() is always False (autograd disables grad during forward), so it
+    # autograd disables grad regardless of the outer context, so it
     # cannot tell training from inference here.
     if not will_backward:
         handle = _handle_cache.pop(handle_id.item(), None)
@@ -272,6 +272,19 @@ def _combine_op_impl(
     # Record completion so the dispatcher can synchronize before returning.
     _pending_combine_event = after_event
     return combined
+
+
+# CPU registrations for logic-level tests only (the kernels require CUDA).
+# They route through whatever object is installed at deepep._buffer, so a
+# test double standing in for EPBuffer exercises the same code paths.
+@torch.library.impl(_lib, "dispatch", "CPU")
+def _dispatch_op_impl_cpu(*args, **kwargs):
+    return _dispatch_op_impl(*args, **kwargs)
+
+
+@torch.library.impl(_lib, "combine", "CPU")
+def _combine_op_impl_cpu(*args, **kwargs):
+    return _combine_op_impl(*args, **kwargs)
 
 
 def _combine_setup_context(ctx, inputs, output):
@@ -339,12 +352,13 @@ def get_buffer(
     num_max_tokens_per_rank: int,
     num_topk: int,
     use_fp8_dispatch: bool = False,
-) -> ElasticBuffer:
-    """Get or create the process-global DeepEP v2 ``ElasticBuffer``.
+) -> EPBuffer:
+    """Get or create the process-global DeepEP v2.5 ``EPBuffer``.
 
-    A single buffer serves both training and inference (v2 unified the HT/LL buffers).
-    It is recreated only if the group changes or a larger buffer is needed. The size
-    is computed analytically by ``get_buffer_size_hint`` from the MoE settings; v2
+    A single buffer serves both training and inference (the former ElasticBuffer
+    unified the v1 HT/LL buffers; EPBuffer carries the same contract). It is
+    recreated only if the group changes or a larger buffer is needed. The size
+    is computed analytically by ``get_buffer_size_hint`` from the MoE settings; DeepEP
     needs ``num_max_tokens_per_rank`` (the max tokens any rank may dispatch in one
     forward) up front because the buffer is sized statically.
 
@@ -355,7 +369,7 @@ def get_buffer(
     vLLM's DeepEP buffer usage and the validated v1 low-latency cudagraph path.
     """
     global _buffer
-    needed_bytes = ElasticBuffer.get_buffer_size_hint(
+    needed_bytes = EPBuffer.get_buffer_size_hint(
         group,
         num_max_tokens_per_rank,
         hidden,
@@ -368,7 +382,7 @@ def get_buffer(
         and _buffer.num_bytes >= needed_bytes
     ):
         return _buffer
-    _buffer = ElasticBuffer(
+    _buffer = EPBuffer(
         group,
         num_bytes=needed_bytes,
         num_max_tokens_per_rank=num_max_tokens_per_rank,
@@ -461,7 +475,7 @@ def dispatch_tokens(
     num_tokens_per_rank: int,
     cudagraphable: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, DispatchState]:
-    """Dispatch tokens to experts via DeepEP v2 ``ElasticBuffer``.
+    """Dispatch tokens to experts via DeepEP v2.5 ``EPBuffer``.
 
     Returns tokens in expert-major order for the grouped-GEMM expert path. In compact mode
     (``cudagraphable=False``) the deduplicated dispatch output is gathered by ``_permute_tokens``

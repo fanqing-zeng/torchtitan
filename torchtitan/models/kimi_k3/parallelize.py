@@ -39,14 +39,13 @@ def parallelize_kimi_k3(
             ("tensor parallel", parallel_dims.tp_enabled),
             ("pipeline parallel", parallel_dims.pp_enabled),
             ("context parallel", parallel_dims.cp_enabled),
-            ("expert parallel", parallel_dims.ep_enabled),
         )
         if enabled
     ]
     if unsupported_parallelisms:
         raise NotImplementedError(
-            "Kimi K3 currently supports FSDP2 data parallelism "
-            f"only; disable {', '.join(unsupported_parallelisms)}."
+            "Kimi K3 currently supports FSDP2 data parallelism and expert "
+            f"parallelism only; disable {', '.join(unsupported_parallelisms)}."
         )
     if parallelism.spmd_backend != "partial_dtensor":
         raise NotImplementedError(
@@ -82,6 +81,15 @@ def parallelize_kimi_k3(
             pp_enabled=False,
         )
 
+    edp_mesh = None
+    if parallel_dims.ep_enabled:
+        edp_mesh_names = (
+            ["dp_replicate", "efsdp"]
+            if parallel_dims.dp_replicate_enabled
+            else ["efsdp"]
+        )
+        edp_mesh = parallel_dims.get_optional_mesh(edp_mesh_names)
+
     apply_fsdp_to_decoder(
         model,
         dp_mesh,
@@ -90,7 +98,8 @@ def parallelize_kimi_k3(
         pp_enabled=False,
         cpu_offload=training.enable_cpu_offload,
         reshard_after_forward_policy=parallelism.fsdp_reshard_after_forward,
-        ep_degree=1,
+        ep_degree=parallel_dims.ep,
+        edp_mesh=edp_mesh,
         enable_symm_mem=parallelism.enable_fsdp_symm_mem,
     )
 

@@ -220,7 +220,32 @@ def _latent_moe_config(
     num_experts: int,
     top_k: int,
     num_shared_experts: int,
+    moe_comm_backend: str = "default",
 ) -> KimiLatentMoE.Config:
+    if moe_comm_backend == "default":
+        token_dispatcher = LocalTokenDispatcher.Config(
+            num_experts=num_experts,
+            top_k=top_k,
+        )
+    elif moe_comm_backend == "moonep":
+        from torchtitan.distributed.moonep import MoonEPTokenDispatcher
+
+        token_dispatcher = MoonEPTokenDispatcher.Config(
+            num_experts=num_experts,
+            top_k=top_k,
+        )
+    elif moe_comm_backend == "deepep":
+        from torchtitan.models.common.token_dispatcher import DeepEPTokenDispatcher
+
+        token_dispatcher = DeepEPTokenDispatcher.Config(
+            num_experts=num_experts,
+            top_k=top_k,
+        )
+    else:
+        raise ValueError(
+            f"Unknown MoE comm backend {moe_comm_backend!r}; expected one of "
+            "'default', 'moonep', 'deepep'."
+        )
     return KimiLatentMoE.Config(
         num_experts=num_experts,
         router=TokenChoiceTopKRouter.Config(
@@ -245,10 +270,7 @@ def _latent_moe_config(
                     "w3_EFD": partial(nn.init.trunc_normal_, std=0.02),
                 },
             ),
-            token_dispatcher=LocalTokenDispatcher.Config(
-                num_experts=num_experts,
-                top_k=top_k,
-            ),
+            token_dispatcher=token_dispatcher,
         ),
         routed_norm=_norm(latent_dim),
         routed_up=_linear(latent_dim, dim),
@@ -367,6 +389,7 @@ def _kimi_k3_config(
     num_shared_experts: int,
     vision_encoder: KimiK3VisionEncoder.Config,
     attn_backend: str,
+    moe_comm_backend: str = "default",
 ) -> KimiK3Model.Config:
     """Assemble a Kimi K3 config from the released topology's free parameters.
 
@@ -420,6 +443,7 @@ def _kimi_k3_config(
                         num_experts=num_experts,
                         top_k=top_k,
                         num_shared_experts=num_shared_experts,
+                        moe_comm_backend=moe_comm_backend,
                     )
                 ),
                 attention_norm=_norm(dim),
@@ -452,7 +476,7 @@ def _kimi_k3_config(
     )
 
 
-def _debugmodel(attn_backend: str) -> KimiK3Model.Config:
+def _debugmodel(attn_backend: str, moe_comm_backend: str) -> KimiK3Model.Config:
     dim = 1024
     return _kimi_k3_config(
         dim=dim,
@@ -485,10 +509,11 @@ def _debugmodel(attn_backend: str) -> KimiK3Model.Config:
             init_pos_emb_width=32,
         ),
         attn_backend=attn_backend,
+        moe_comm_backend=moe_comm_backend,
     )
 
 
-def _kimi_k3(attn_backend: str) -> KimiK3Model.Config:
+def _kimi_k3(attn_backend: str, moe_comm_backend: str) -> KimiK3Model.Config:
     dim = 7168
     return _kimi_k3_config(
         dim=dim,
@@ -521,6 +546,7 @@ def _kimi_k3(attn_backend: str) -> KimiK3Model.Config:
             init_pos_emb_width=64,
         ),
         attn_backend=attn_backend,
+        moe_comm_backend=moe_comm_backend,
     )
 
 
@@ -533,9 +559,12 @@ kimi_k3_configs = {
 def model_registry(
     flavor: str,
     attn_backend: str = "flex",
+    moe_comm_backend: str = "default",
     converters: list[ModelConfigConverter.Config] | None = None,
 ) -> ModelSpec:
-    config = kimi_k3_configs[flavor](attn_backend=attn_backend)
+    config = kimi_k3_configs[flavor](
+        attn_backend=attn_backend, moe_comm_backend=moe_comm_backend
+    )
     if converters is not None:
         validate_converter_order(converters)
         for converter in converters:

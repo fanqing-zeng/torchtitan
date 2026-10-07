@@ -26,6 +26,14 @@ from torchtitan.ops.scatter_add import deterministic_scatter_add
 from torchtitan.tools.utils import device_module, device_type
 
 
+def _moon_ep_dispatcher_cls() -> type:
+    """Lazily resolve MoonEPTokenDispatcher so core does not hard-import the
+    moonep-dependent module tree (its primitives import ``moonep``)."""
+    from torchtitan.distributed.moonep import MoonEPTokenDispatcher
+
+    return MoonEPTokenDispatcher
+
+
 @dataclass(frozen=True, kw_only=True)
 class LocalDispatchMetadata:
     """Metadata returned by LocalTokenDispatcher.dispatch() for use in combine()."""
@@ -783,7 +791,7 @@ class EPDispatchMetadata:
 
 
 class DeepEPTokenDispatcher(BaseEPTokenDispatcher):
-    """Token dispatcher using DeepEP v2's unified ``ElasticBuffer`` dispatch/combine.
+    """Token dispatcher using DeepEP v2.5's unified ``EPBuffer`` dispatch/combine.
 
     DeepEP v2 (>= 2.0.0) collapses the v1 high-throughput (HT) and low-latency (LL)
     paths into a single ``buffer.dispatch``/``combine``. Compact dispatch is gathered
@@ -845,7 +853,7 @@ class DeepEPTokenDispatcher(BaseEPTokenDispatcher):
         topk_expert_ids_TK: torch.Tensor,
         num_local_tokens_per_expert_E: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, EPDispatchMetadata]:
-        """Dispatch through the preallocated ElasticBuffer."""
+        """Dispatch through the preallocated EPBuffer."""
         # Ignore input num_local_tokens_per_expert_E. DeepEP returns the number
         # of global routed tokens for every local expert using other inputs.
         del num_local_tokens_per_expert_E
@@ -1196,6 +1204,7 @@ class MinimalAsyncEPTokenDispatcher(BaseEPTokenDispatcher):
 def update_ep_token_dispatcher_config(model_config: Any, config: Any) -> None:
     """Validate and fill EP token dispatcher configs from runtime config."""
     parallelism = config.parallelism
+    MoonEPTokenDispatcher = _moon_ep_dispatcher_cls()
     dispatcher_cfgs = []
     for layer_cfg in model_config.layers:
         moe_cfg = getattr(layer_cfg, "moe", None)
@@ -1208,6 +1217,7 @@ def update_ep_token_dispatcher_config(model_config: Any, config: Any) -> None:
                 DeepEPTokenDispatcher.Config,
                 HybridEPTokenDispatcher.Config,
                 MinimalAsyncEPTokenDispatcher.Config,
+                MoonEPTokenDispatcher.Config,
             ),
         ):
             continue
@@ -1242,7 +1252,17 @@ def update_ep_token_dispatcher_config(model_config: Any, config: Any) -> None:
                 "parallelism (expert_parallel_degree > 1)."
             )
 
-        token_dispatcher_cfg.hidden_dim = model_config.dim
+        # The dispatcher moves tokens in the expert-input space, so size the
+        # buffers by the experts' input dim. For latent MoE (e.g. kimi_k3)
+        # tokens are projected down to the expert dim before dispatch, and
+        # inner_experts.dim differs from the model dim.
+        token_dispatcher_cfg.hidden_dim = moe_cfg.routed_experts.inner_experts.dim
+        if isinstance(token_dispatcher_cfg, MoonEPTokenDispatcher.Config):
+            # MoonEP also sizes its weight prefetch pools by the expert FFN
+            # intermediate dim.
+            token_dispatcher_cfg.expert_hidden_dim = (
+                moe_cfg.routed_experts.inner_experts.hidden_dim
+            )
         configured_capacity = token_dispatcher_cfg.num_max_tokens_per_rank
         if configured_capacity is not None and configured_capacity <= 0:
             raise ValueError(

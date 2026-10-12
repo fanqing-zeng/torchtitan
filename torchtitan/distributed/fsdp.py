@@ -41,6 +41,7 @@ logger = logging.getLogger(__name__)
 if TYPE_CHECKING:
     from torchtitan.models.common.decoder import Decoder
     from torchtitan.models.common.moe import MoE
+    from torchtitan.models.common.moonep import MoonEPRoutedExperts
 
 
 _DENSE_STORAGE_AXES = ["dp_replicate", "dp_shard", "cp", "tp"]
@@ -324,6 +325,13 @@ def apply_fsdp_to_decoder(
                 reshard_after_forward=reshard_after_forward_policy == "always",
             )
 
+    # (module, w13 weight, w2 weight) triples for MoonEP expert weights
+    # deregistered around every fully_shard call; restored after the root
+    # fully_shard below.
+    moonep_expert_weights: list[
+        tuple[MoonEPRoutedExperts, nn.Parameter, nn.Parameter]
+    ] = []
+
     for layer_id, transformer_block in model.layers.items():
         # A stacked Linear keeps W1/W3 separate from the matrix-row dimension.
         # Shard matrix rows so every rank retains both projections.
@@ -365,6 +373,24 @@ def apply_fsdp_to_decoder(
                         include_unstacked_grouped=True,
                     )
                 )
+            # MoonEP replaces expert-parallel FSDP sharding with its own
+            # symmetric-memory layout: after weight init (before optimizer
+            # creation) the MoonEP training runtime copies these weights
+            # into symmetric memory and deregisters them. Deregister them
+            # around every fully_shard call, including the root one below,
+            # so FSDP neither shards them nor allocates communication
+            # buckets for them. Do this after all placement dicts above are
+            # computed: they may hold entries for these weights, but
+            # shard_placement_fn is only consulted for parameters that
+            # fully_shard manages.
+            from torchtitan.models.common.moonep import MoonEPRoutedExperts
+
+            if isinstance(routed_experts, MoonEPRoutedExperts):
+                w13_weight = routed_experts.w13.weight
+                w2_weight = routed_experts.w2.weight
+                routed_experts.w13.register_parameter("weight", None)
+                routed_experts.w2.register_parameter("weight", None)
+                moonep_expert_weights.append((routed_experts, w13_weight, w2_weight))
             if ep_degree == 1:
                 param_placements = stacked_param_placements.copy()
                 param_placements.update(expert_param_placements)
@@ -432,6 +458,13 @@ def apply_fsdp_to_decoder(
             )
 
     fully_shard(model, **fsdp_config)
+
+    # Re-register the MoonEP expert weights popped around fully_shard so
+    # to_empty() and weight init materialize them; the MoonEP runtime swaps
+    # them for symmetric-memory projections after init.
+    for module, w13_weight, w2_weight in moonep_expert_weights:
+        module.w13.register_parameter("weight", w13_weight)
+        module.w2.register_parameter("weight", w2_weight)
 
     enable_fsdp_symm_mem(model, symm_mem_scope)
 

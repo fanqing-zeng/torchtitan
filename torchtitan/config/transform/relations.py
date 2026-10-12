@@ -13,6 +13,7 @@ from .base import ModelConfigTransform
 from .context_parallel import ContextParallelTransform
 from .dist_moe import DistMoeTransform
 from .lora import LoRATransform
+from .moonep import MoonEPTransform
 from .token_dispatcher import TokenDispatcherTransform
 
 TransformType: TypeAlias = type[ModelConfigTransform]
@@ -30,6 +31,8 @@ _BUILTIN_PRECEDES: tuple[PrecedenceRelation, ...] = (
     (ContextParallelTransform, LoRATransform),
     # Dist-MoE must create DistMoeRoutedExperts.Config before LoRA can adapt it.
     (DistMoeTransform, LoRATransform),
+    # MoonEP must create MoonEPRoutedExperts.Config before LoRA can adapt it.
+    (MoonEPTransform, LoRATransform),
 )
 
 # Each pair is unordered.
@@ -45,6 +48,12 @@ _BUILTIN_CONFLICTS: tuple[ConflictRelation, ...] = (
     # Dist-MoE owns token dispatch and combine instead of calling the selected
     # token dispatcher's runtime implementation.
     (DistMoeTransform, TokenDispatcherTransform),
+    # MoonEP owns token dispatch and combine instead of calling the selected
+    # token dispatcher's runtime implementation.
+    (MoonEPTransform, TokenDispatcherTransform),
+    # Dist-MoE and MoonEP both replace routed experts with their own
+    # execution backend.
+    (DistMoeTransform, MoonEPTransform),
 )
 
 

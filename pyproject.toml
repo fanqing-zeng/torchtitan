@@ -47,6 +47,12 @@ dev = [
     "expecttest", # test_tokenizer
     "pyrefly==0.45.1",
 ]
+# Ascend NPU support for MoonEP expert parallelism. The ascend_moonep C
+# extension is not published on PyPI; build and install it from the
+# ascend-moonep repository.
+npu = [
+    "torch_npu",
+]
 
 [tool.setuptools.dynamic]
 version = {file = "assets/version.txt"}
@@ -79,6 +85,7 @@ project-excludes = ["torchtitan/experiments", "torchtitan/rl", "**/tests/**"]
 replace-imports-with-any = [
     "torchao.*", "torchft", "torchvision.*", "deep_ep.*", "jinja2.*", "helion", "helion.*", "batch_invariant_ops", "verifiers.*", # optional dependencies
     "dist_moe", "dist_moe.*", # optional dependency without Pyrefly stubs
+    "torch_npu", "torch_npu.*", "ascend_moonep", "ascend_moonep.*", # npu extra, no Pyrefly stubs
     # torch_remat is required, but does not publish Pyrefly stubs.
     "torch_remat",
 ]

@@ -52,6 +52,7 @@ from torchtitan.tools.garbage_collector import GarbageCollector
 
 if TYPE_CHECKING:
     from torchtitan.models.common.dist_moe.runtime import DistMoeRuntime
+    from torchtitan.models.common.moonep import MoonEPTrainingRuntime
 
 
 logger = logging.getLogger(__name__)
@@ -126,12 +127,44 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
         dist_moe: Configurable.Config | None = None
         """Optional rank-wide Dist-MoE memory and pipeline-slot policy."""
 
+        moonep: Configurable.Config | None = None
+        """Optional Ascend MoonEP symmetric-memory expert-parallel runtime.
+
+        Requires ``training.dtype='bfloat16'``, activation checkpointing off,
+        CUDA graphs disabled, and no CPU offload; parallel-layout constraints
+        (NPU device, EP > 1, PP = 1, dp_replicate = 1,
+        ``dp_shard * cp * tp == ep``) are validated when the runtime is built.
+        """
+
         def __post_init__(self) -> None:
             if (
                 self.dist_moe is not None
                 and self.training.mixed_precision_param != "bfloat16"
             ):
                 raise ValueError("Dist-MoE requires mixed_precision_param='bfloat16'")
+            if self.moonep is not None:
+                errors: list[str] = []
+                if self.training.dtype != "bfloat16":
+                    errors.append(
+                        f"training.dtype 'bfloat16' (found {self.training.dtype!r})"
+                    )
+                if self.activation_checkpoint is not None:
+                    errors.append(
+                        "activation_checkpoint to be off "
+                        "(activation_checkpoint=None)"
+                    )
+                if not self.training.disable_cuda_graphs:
+                    errors.append(
+                        "training.disable_cuda_graphs=true (MoonEP owns its "
+                        "own streams)"
+                    )
+                if self.training.enable_cpu_offload:
+                    errors.append("training.enable_cpu_offload=false")
+                if errors:
+                    raise ValueError(
+                        "MoonEP (ascend_moonep) requires:\n"
+                        + "\n".join(f"  - {error}" for error in errors)
+                    )
             if (
                 self.debug.spmd_typechecking
                 and self.parallelism.pipeline_parallel_degree > 1
@@ -231,6 +264,7 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
     _run_forward_backward: _ForwardBackwardFn
     _cuda_graph_per_accumulation_group_enabled: bool
     _dist_moe_runtime: "DistMoeRuntime | None"
+    _moonep_runtime: "MoonEPTrainingRuntime | None"
 
     def __init__(
         self,
@@ -253,6 +287,7 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
         self.sdc_replayer = None
         self._cuda_graph_per_accumulation_group_enabled = False
         self._dist_moe_runtime = None
+        self._moonep_runtime = None
         self.preprocess_inputs_kwargs: dict[str, Any] = {}
         self.loss_metrics = {}
         self._initialize_distributed_runtime()
@@ -300,6 +335,7 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
             create_seed_checkpoint=create_seed_checkpoint,
         )
         self.model_device_mem_stats = self.device_memory_monitor.get_peak_stats()
+        self._initialize_moonep(create_seed_checkpoint=create_seed_checkpoint)
         self._initialize_optim()
         self._initialize_checkpointer(
             extra_states=extra_states,
@@ -418,6 +454,31 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
         # GraphTrainer to stop reading its compile config there first (apply_compile,
         # EP-overlap chunking, enable_autoparallel, GraphPP runtime); then delete this hook.
         return {"local_compile_regions": self.model_config.local_compile_regions}
+
+    def _initialize_moonep(self, *, create_seed_checkpoint: bool) -> None:
+        """Swap MoonEP expert weights into symmetric memory.
+
+        Runs after weight init, so initialized weights are copied into
+        symmetric memory, and before optimizer creation, because the swap
+        deregisters ``w13``/``w2`` and registers the symmetric-memory
+        ``gate_up_proj``/``down_proj`` parameters the optimizer must manage.
+        """
+        if self.config.moonep is None:
+            return
+        if create_seed_checkpoint:
+            raise ValueError(
+                "MoonEP does not support seed checkpoint creation: the "
+                "symmetric-memory weight swap changes the checkpoint format. "
+                "Create seed checkpoints without moonep configured."
+            )
+        self._moonep_runtime = self.config.moonep.build(
+            model_parts=self.model_parts,
+            parallelism_context=self.parallelism_context,
+            device=self.device,
+            num_tokens_per_microbatch_per_dp_rank=(
+                self.config.training.num_tokens_per_microbatch_per_dp_rank
+            ),
+        )
 
     def _initialize_optim(self) -> None:
         """Construct the parameter update and its state."""
@@ -829,5 +890,8 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
         if self._dist_moe_runtime is not None:
             self._dist_moe_runtime.close()
             self._dist_moe_runtime = None
+        if self._moonep_runtime is not None:
+            self._moonep_runtime.close()
+            self._moonep_runtime = None
         if hasattr(self, "checkpointer"):
             self.checkpointer.close()

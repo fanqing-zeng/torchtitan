@@ -52,6 +52,28 @@ def _copy_full_counts_to_peer_ptrs_kernel(
 
 
 @triton.jit
+def _copy_full_counts_to_peer_direct_kernel(
+    counts: tl.pointer_type(tl.int64),
+    dst: tl.pointer_type(tl.int64),
+    RANK: tl.constexpr,
+    NUM_EXPERTS: tl.constexpr,
+    DST_ROW_STRIDE: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+) -> None:
+    """Direct-pointer variant of :func:`_copy_full_counts_to_peer_ptrs_kernel`.
+
+    Writes ``counts[:]`` into row ``RANK`` of ONE peer's buffer; the wrapper
+    launches it once per peer. Peer buffers arrive as real tensor pointers,
+    which avoids the int-to-pointer conversion that some triton backends
+    cannot lower (native abort in ttir_to_linalg).
+    """
+    offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < NUM_EXPERTS
+    values = tl.load(counts + offsets, mask=mask, other=0)
+    tl.store(dst + RANK * DST_ROW_STRIDE + offsets, values, mask=mask)
+
+
+@triton.jit
 def _fill_dispatch_metadata_kernel(
     counts: tl.pointer_type(tl.int64),
     local_dest_offsets: tl.pointer_type(tl.int64),
@@ -348,6 +370,59 @@ def _copy_rows_to_peer_ptrs_kernel(
     tl.store(dst_ptr, values, mask=mask & dst_rank_mask[:, None])
 
 
+@triton.jit
+def _copy_rows_to_peer_direct_kernel(
+    src,
+    dst,
+    dst_ranks: tl.pointer_type(tl.int64),
+    dst_rows: tl.pointer_type(tl.int64),
+    num_valid_rows: tl.pointer_type(tl.int64),
+    src_rows: tl.pointer_type(tl.int64),
+    PEER_RANK: tl.constexpr,
+    NUM_ROWS: tl.constexpr,
+    NUM_COLS: tl.constexpr,
+    SRC_ROW_STRIDE: tl.constexpr,
+    SRC_COL_STRIDE: tl.constexpr,
+    DST_ROW_STRIDE: tl.constexpr,
+    HAS_NUM_VALID_ROWS: tl.constexpr,
+    HAS_SRC_ROWS: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+) -> None:
+    """Direct-pointer variant of :func:`_copy_rows_to_peer_ptrs_kernel`.
+
+    Copies the rows destined for ONE peer (``dst_ranks[row] == PEER_RANK``)
+    into that peer's buffer, passed as a real tensor pointer. Avoids the
+    int-to-pointer conversion of the pointer-table variant, which some
+    triton backends cannot lower (native abort in ttir_to_linalg).
+    """
+    row_start = tl.program_id(0) * BLOCK_M
+    row_limit = NUM_ROWS
+    if HAS_NUM_VALID_ROWS:
+        row_limit = tl.load(num_valid_rows)
+        if row_start >= row_limit:
+            return
+    row = (row_start + tl.arange(0, BLOCK_M)).to(tl.int64)
+    col = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
+    row_mask = row < row_limit
+    col_mask = col < NUM_COLS
+    src_row = row
+    if HAS_SRC_ROWS:
+        src_row = tl.load(src_rows + row, mask=row_mask, other=0).to(tl.int64)
+    dst_rank = tl.load(dst_ranks + row, mask=row_mask, other=-1)
+    peer_mask = row_mask & (dst_rank == PEER_RANK)
+    values = tl.load(
+        src + src_row[:, None] * SRC_ROW_STRIDE + col[None, :] * SRC_COL_STRIDE,
+        mask=peer_mask[:, None] & col_mask[None, :],
+    )
+    dst_row = tl.load(dst_rows + row, mask=row_mask, other=0).to(tl.int64)
+    tl.store(
+        dst + dst_row[:, None] * DST_ROW_STRIDE + col[None, :],
+        values,
+        mask=peer_mask[:, None] & col_mask[None, :],
+    )
+
+
 def copy_full_counts_to_peers_kernel(
     counts: torch.Tensor,
     dsts: list[torch.Tensor],
@@ -355,7 +430,7 @@ def copy_full_counts_to_peers_kernel(
     rank: int,
     ep_size: int,
     num_experts: int,
-    dst_ptrs: torch.Tensor,
+    dst_ptrs: torch.Tensor | None = None,
 ) -> None:
     if counts.dtype != torch.int64:
         raise ValueError(f"counts must be torch.int64, got {counts.dtype}.")
@@ -367,16 +442,20 @@ def copy_full_counts_to_peers_kernel(
         )
 
     block_size = _COUNT_COPY_BLOCK_SIZE
-    grid = (ep_size, triton.cdiv(num_experts, block_size))
-    _copy_full_counts_to_peer_ptrs_kernel[grid](
-        counts,
-        dst_ptrs,
-        rank=rank,
-        EP_SIZE=ep_size,
-        NUM_EXPERTS=num_experts,
-        DST_ROW_STRIDE=dsts[0].stride(0),
-        BLOCK_SIZE=block_size,
-    )
+    # Per-peer direct launches: peer buffers arrive as real tensor pointers.
+    # (``dst_ptrs`` is kept in the signature for the pointer-table variant,
+    # which some triton backends cannot lower.)
+    for peer in range(ep_size):
+        _copy_full_counts_to_peer_direct_kernel[
+            (triton.cdiv(num_experts, block_size),)
+        ](
+            counts,
+            dsts[peer],
+            RANK=rank,
+            NUM_EXPERTS=num_experts,
+            DST_ROW_STRIDE=dsts[peer].stride(0),
+            BLOCK_SIZE=block_size,
+        )
 
 
 def copy_rows_to_peers_kernel(
@@ -388,7 +467,7 @@ def copy_rows_to_peers_kernel(
     ep_size: int,
     num_rows: int,
     num_cols: int,
-    dst_ptrs: torch.Tensor,
+    dst_ptrs: torch.Tensor | None = None,
     block_m: int = 1,
     num_warps: int = 4,
     src_rows: torch.Tensor | None = None,
@@ -402,25 +481,29 @@ def copy_rows_to_peers_kernel(
     dst_dtype = _HIDDEN_ROW_DTYPES.get(src.dtype)
     if dst_dtype is None:
         raise ValueError(f"Unsupported MinimalAsyncEP row-copy dtype: {src.dtype}.")
-    _copy_rows_to_peer_ptrs_kernel[grid](
-        src,
-        dst_ptrs,
-        dst_ranks,
-        dst_rows,
-        num_valid_rows if num_valid_rows is not None else dst_rows[:1],
-        src_rows if src_rows is not None else dst_rows,
-        NUM_ROWS=num_rows,
-        NUM_COLS=num_cols,
-        SRC_ROW_STRIDE=src.stride(0),
-        SRC_COL_STRIDE=src.stride(1),
-        DST_ROW_STRIDE=dsts[0].stride(0),
-        DST_DTYPE=dst_dtype,
-        HAS_NUM_VALID_ROWS=num_valid_rows is not None,
-        HAS_SRC_ROWS=src_rows is not None,
-        BLOCK_M=block_m,
-        BLOCK_N=block_n,
-        num_warps=num_warps,
-    )
+    # Per-peer direct launches: peer buffers arrive as real tensor pointers.
+    # (``dst_ptrs`` is kept in the signature for the pointer-table variant,
+    # which some triton backends cannot lower.)
+    for peer in range(ep_size):
+        _copy_rows_to_peer_direct_kernel[grid](
+            src,
+            dsts[peer],
+            dst_ranks,
+            dst_rows,
+            num_valid_rows if num_valid_rows is not None else dst_rows[:1],
+            src_rows if src_rows is not None else dst_rows,
+            PEER_RANK=peer,
+            NUM_ROWS=num_rows,
+            NUM_COLS=num_cols,
+            SRC_ROW_STRIDE=src.stride(0),
+            SRC_COL_STRIDE=src.stride(1),
+            DST_ROW_STRIDE=dsts[peer].stride(0),
+            HAS_NUM_VALID_ROWS=num_valid_rows is not None,
+            HAS_SRC_ROWS=src_rows is not None,
+            BLOCK_M=block_m,
+            BLOCK_N=block_n,
+            num_warps=num_warps,
+        )
 
 
 def fill_dispatch_metadata_kernel(

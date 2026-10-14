@@ -373,7 +373,15 @@ def _reshape_for_broadcast(
     # view path. If singleton-ness is symbolic, fall through to gather below.
     if guard_or_false(positions.size(0) == 1):
         # assert positions.shape == (1, seqlen)
-        rope_cache = rope_cache[positions.squeeze(0)]
+        if rope_cache.is_complex():
+            # Some backends have no COMPLEX64 index kernel: index the real
+            # view (interleaved real/imag pairs) and restore the complex
+            # layout.
+            rope_cache = torch.view_as_complex(
+                torch.view_as_real(rope_cache)[positions.squeeze(0)]
+            )
+        else:
+            rope_cache = rope_cache[positions.squeeze(0)]
         # assert rope_cache.shape == (seqlen, cache_width)
         shape = [
             d if i == 1 else cache_width if i == ndim - 1 else 1
@@ -385,12 +393,30 @@ def _reshape_for_broadcast(
         # not statically provable above, use the general gather path.
         # assert positions.shape == (bsz, seqlen)
         positions = positions.expand(bsz, -1)
-        rope_cache_expanded = rope_cache[None, :, None, :].expand(bsz, -1, -1, -1)
-        rope_cache = torch.gather(
-            rope_cache_expanded,
-            dim=1,
-            index=positions.view(bsz, seqlen, 1, 1).expand(bsz, seqlen, 1, cache_width),
-        )
+        if rope_cache.is_complex():
+            # Some backends have no COMPLEX64 gather kernel: gather the real
+            # view and restore the complex layout. Bit-identical to gathering
+            # the complex cache directly (pairs move as units).
+            real_cache = torch.view_as_real(rope_cache)
+            real_cache_expanded = real_cache[None, :, None, :, :].expand(
+                bsz, -1, -1, -1, -1
+            )
+            rope_cache = torch.view_as_complex(
+                torch.gather(
+                    real_cache_expanded,
+                    dim=1,
+                    index=positions.view(bsz, seqlen, 1, 1, 1).expand(
+                        bsz, seqlen, 1, cache_width, 2
+                    ),
+                )
+            )
+        else:
+            rope_cache_expanded = rope_cache[None, :, None, :].expand(bsz, -1, -1, -1)
+            rope_cache = torch.gather(
+                rope_cache_expanded,
+                dim=1,
+                index=positions.view(bsz, seqlen, 1, 1).expand(bsz, seqlen, 1, cache_width),
+            )
         return rope_cache
 
 

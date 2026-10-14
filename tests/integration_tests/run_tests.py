@@ -12,6 +12,7 @@ import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 
+import torch  # noqa: F401  # imported before torchtitan modules so backend autoload cannot re-enter their initialization
 from torchtitan.tools.logging import logger
 
 from tests.integration_tests import OverrideDefinitions

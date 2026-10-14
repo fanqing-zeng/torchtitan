@@ -67,6 +67,7 @@ def deepseek_v3_debugmodel_fused_mla_swiglu_fsdp4_ep2() -> Trainer.Config:
     config.override.imports = [
         "torchtitan.overrides.fused_mla.fused_mla",
         "torchtitan.overrides.fused_swiglu.fused_swiglu",
+        "torchtitan.overrides.composite_fused_ops.composite_fused_ops",
     ]
     config.parallelism.data_parallel_shard_degree = 4
     config.parallelism.expert_parallel_degree = 2
@@ -129,6 +130,15 @@ def qwen35_debugmodel_moe_fsdp2_tp2_pp2_ep4() -> Trainer.Config:
     config.parallelism.expert_parallel_degree = 4
     _use_spmd_types(config, typechecking=False)
     config.training.disable_cuda_graphs = True
+    # eager_flex: mitigation for the intermittent FSDP2 bf16 param-copy
+    # corruption under the compiled flex hop (see EP_TEST_REWORK_REPORT.md
+    # section 0.2); revert once the torch_npu FSDP2 all-gather defect is fixed.
+    config.override.imports = [
+        "torchtitan.overrides.eager_flex_attention.eager_flex_attention"
+    ]
+    # First-run FLA/TileLang kernel compile and autotune exceed the default
+    # 100s train timeout.
+    config.comm.train_timeout_seconds = 600
     return config
 
 
@@ -192,6 +202,10 @@ def kimi_k2_5_debugmodel_muon_fsdp4_ep2() -> Trainer.Config:
 
     config = kimi_k2_5_debugmodel()
     _use_spmd_types(config, typechecking=True)
+    # eager_flex: same mitigation as qwen3_5 (see section 0.2 of the report).
+    config.override.imports = [
+        "torchtitan.overrides.eager_flex_attention.eager_flex_attention"
+    ]
     config.parallelism.data_parallel_shard_degree = 4
     config.parallelism.expert_parallel_degree = 2
     config.training.steps = 1

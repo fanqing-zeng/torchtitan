@@ -38,6 +38,7 @@ from torchtitan.distributed.minimal_async_ep.kernels import (
     topk_scores_grad_kernel,
 )
 from torchtitan.tools.logging import logger
+from torchtitan.tools.utils import device_type
 
 
 _HIDDEN_RECV_BUFFER_COUNT = 2
@@ -219,12 +220,17 @@ def init_buffer(
         group.size(),
         max_routed_tokens,
     )
-    backend = symm_mem.get_backend(device)
-    if backend != "CUDA":
+    # Probe actual symmetric-memory usability (allocate + rendezvous + take a
+    # peer view) instead of matching backend names, which differ per platform.
+    try:
+        probe = symm_mem.empty(group.size(), dtype=torch.int64, device=device)
+        handle = symm_mem.rendezvous(probe, group)
+        handle.get_buffer(0, probe.shape, probe.dtype)
+    except Exception as e:
         raise RuntimeError(
-            "MinimalAsyncEP custom all-to-allv requires the symmetric-memory CUDA "
-            f"backend, got {backend}."
-        )
+            "MinimalAsyncEP requires a working symmetric-memory backend on "
+            f"{device.type}: {e}"
+        ) from e
 
     hidden_recv_buffers = [
         symm_mem.empty(
@@ -560,7 +566,7 @@ def _dispatch_metadata(
 @torch.library.custom_op(
     "minimal_async_ep::dispatch",
     mutates_args=(),
-    device_types="cuda",
+    device_types=device_type,
 )
 def dispatch_op(
     dispatch_input: torch.Tensor,
@@ -686,7 +692,7 @@ def dispatch_op_fake(
 @torch.library.custom_op(
     "minimal_async_ep::combine",
     mutates_args=(),
-    device_types="cuda",
+    device_types=device_type,
 )
 def combine_op(
     x: torch.Tensor,
@@ -767,7 +773,7 @@ def combine_op_fake(
 @torch.library.custom_op(
     "minimal_async_ep::dispatch_backward",
     mutates_args=(),
-    device_types="cuda",
+    device_types=device_type,
 )
 def dispatch_backward_op(
     grad_hidden: torch.Tensor,
@@ -828,7 +834,7 @@ def dispatch_backward_op_fake(
 @torch.library.custom_op(
     "minimal_async_ep::combine_backward",
     mutates_args=(),
-    device_types="cuda",
+    device_types=device_type,
 )
 def combine_backward_op(
     grad_out: torch.Tensor,

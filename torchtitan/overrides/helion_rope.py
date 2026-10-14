@@ -48,6 +48,7 @@ from torch.distributed.tensor import DTensor
 from torchtitan.config import derive, override
 from torchtitan.models.common.rope import _maybe_check_max_pos, ComplexRoPE, CosSinRoPE
 from torchtitan.tools.logging import logger, warn_once
+from torchtitan.tools.utils import device_type
 
 if TYPE_CHECKING:
     # The type checker always sees helion as importable (resolved to Any via
@@ -990,6 +991,13 @@ class HelionComplexRoPE(ComplexRoPE):
     description="Fused Helion cos/sin rotary embedding (CUDA).",
 )
 def helion_cos_sin_rope(cfg: CosSinRoPE.Config) -> HelionCosSinRoPE.Config:
+    if device_type != "cuda":
+        warn_once(
+            logger,
+            "HelionCosSinRoPE override requested but Helion kernels require "
+            f"CUDA; running stock CosSinRoPE on {device_type}.",
+        )
+        return cfg
     if _HELION_IMPORT_ERROR is not None:
         raise ImportError(
             "HelionCosSinRoPE override was requested but `helion` is not installed; "
@@ -1004,6 +1012,13 @@ def helion_cos_sin_rope(cfg: CosSinRoPE.Config) -> HelionCosSinRoPE.Config:
     description="Fused Helion complex rotary embedding (CUDA).",
 )
 def helion_complex_rope(cfg: ComplexRoPE.Config) -> HelionComplexRoPE.Config:
+    if device_type != "cuda":
+        warn_once(
+            logger,
+            "HelionComplexRoPE override requested but Helion kernels require "
+            f"CUDA; running stock ComplexRoPE on {device_type}.",
+        )
+        return cfg
     if _HELION_IMPORT_ERROR is not None:
         raise ImportError(
             "HelionComplexRoPE override was requested but `helion` is not "

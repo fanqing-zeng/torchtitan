@@ -109,6 +109,14 @@ def qwen3_debugmodel_first_85_pct_layers_nvfp4() -> Trainer.Config:
 
 def qwen3_debugmodel_moe_param_groups() -> Trainer.Config:
     config = qwen3_moe_debug()
+    # fused-adam fallback: torch_npu's PU1 kernel for aten::_fused_adam_ calls
+    # aclnnFusedAdam, absent from CANN 9.2.0-beta.2 libopapi.so; the Adam group
+    # (router.gate) crashes at optimizer.step() on 950DT (910B2 falls back to
+    # CPU in C++). Re-register the kernel with a composite implementation that
+    # is bitwise-identical to foreach Adam.
+    config.override.imports = [
+        "torchtitan.overrides.fused_adam_npu_fallback.fused_adam_npu_fallback"
+    ]
     config.optimizer = OptimizersContainer.Config(
         param_groups=[
             ParamGroupConfig(

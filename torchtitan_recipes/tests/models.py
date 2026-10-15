@@ -36,6 +36,12 @@ def deepseek_v3_debugmodel_mtp_fsdp4_ep2_compile() -> Trainer.Config:
         "torchtitan.overrides.helion_rope.helion_complex_rope",
     ]
     config.training.disable_cuda_graphs = True
+    # eager_flex: the compiled flex_attention backward kernel fails on
+    # Ascend 950DT (vector core 507035 / all-tiling-not-runnable); run
+    # the MTP-module FlexAttention eagerly until triton-ascend catches up.
+    config.override.imports = [
+        "torchtitan.overrides.eager_flex_attention.eager_flex_attention"
+    ]
     return config
 
 
@@ -58,6 +64,12 @@ def deepseek_v3_debugmodel_hsdp2x2_ep2() -> Trainer.Config:
     config.parallelism.data_parallel_shard_degree = 2
     config.parallelism.expert_parallel_degree = 2
     config.training.disable_cuda_graphs = True
+    # eager_flex: the compiled flex_attention backward kernel fails on
+    # Ascend 950DT (vector core 507035 / all-tiling-not-runnable); run
+    # the MTP-module FlexAttention eagerly until triton-ascend catches up.
+    config.override.imports = [
+        "torchtitan.overrides.eager_flex_attention.eager_flex_attention"
+    ]
     return config
 
 
@@ -65,6 +77,7 @@ def deepseek_v3_debugmodel_fused_mla_swiglu_fsdp4_ep2() -> Trainer.Config:
     config = deepseek_v3_debugmodel()
     _use_spmd_types(config, typechecking=True)
     config.override.imports = [
+        "torchtitan.overrides.eager_flex_attention.eager_flex_attention",
         "torchtitan.overrides.fused_mla.fused_mla",
         "torchtitan.overrides.fused_swiglu.fused_swiglu",
         "torchtitan.overrides.composite_fused_ops.composite_fused_ops",

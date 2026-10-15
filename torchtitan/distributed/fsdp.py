@@ -8,6 +8,8 @@ import logging
 from collections.abc import Callable
 from typing import Any, cast, TYPE_CHECKING
 
+import functools
+
 import torch
 import torch.nn as nn
 from torch.distributed._composable.fsdp import FSDPModule
@@ -223,6 +225,14 @@ def apply_fsdp_to_multimodal_encoder(
     fully_shard(encoder, **fsdp_config)
 
 
+@functools.lru_cache(maxsize=1)
+def _mixed_precision_policy_params() -> frozenset[str]:
+    """Parameter names torch's MixedPrecisionPolicy accepts (varies by build)."""
+    import inspect
+
+    return frozenset(inspect.signature(MixedPrecisionPolicy.__init__).parameters)
+
+
 def apply_fsdp_to_decoder(
     model: "Decoder",
     dp_mesh: DeviceMesh,
@@ -281,12 +291,19 @@ def apply_fsdp_to_decoder(
         param_dtype_override_fn: Optional callback that overrides ``param_dtype``
             for selected parameters.
     """
-    mp_policy = MixedPrecisionPolicy(
-        param_dtype=param_dtype,
-        reduce_dtype=reduce_dtype,
-        cast_forward_inputs=False,
-        param_dtype_override_fn=param_dtype_override_fn,
-    )
+    mp_policy_kwargs: dict[str, Any] = {
+        "param_dtype": param_dtype,
+        "reduce_dtype": reduce_dtype,
+        "cast_forward_inputs": False,
+    }
+    if param_dtype_override_fn is not None:
+        if "param_dtype_override_fn" not in _mixed_precision_policy_params():
+            raise RuntimeError(
+                "param_dtype_override_fn requires a torch build whose "
+                "MixedPrecisionPolicy supports it (torch 2.14.0 test/RC or newer)."
+            )
+        mp_policy_kwargs["param_dtype_override_fn"] = param_dtype_override_fn
+    mp_policy = MixedPrecisionPolicy(**mp_policy_kwargs)
     fsdp_config: dict[str, Any] = {"mesh": dp_mesh, "mp_policy": mp_policy}
     if dp_mesh_dims is not None:
         fsdp_config["dp_mesh_dims"] = dp_mesh_dims

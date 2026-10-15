@@ -22,8 +22,9 @@ from torchtitan.components.optim import (
 )
 from torchtitan.components.tokenizer import MultiModalTokenizer
 from torchtitan.config import TrainingConfig
+from torchtitan.config.override import OverrideConfig
 from torchtitan.config.parallelism import ParallelismConfig
-from torchtitan.distributed.activation_checkpoint import SelectiveAC
+from torchtitan.distributed.activation_checkpoint import RegionAC, SelectiveAC
 from torchtitan.distributed.flex_shard import (
     BlockShard,
     BucketConfig,
@@ -124,7 +125,25 @@ def kimi_k3_debugmodel(
         ),
         parallelism=parallelism,
         checkpointer=None,
-        activation_checkpoint=SelectiveAC.Config(),
+        # NPU: SelectiveAC (save-only mode included) crashes the fla_npu ctypes
+        # KDA path with a native SIGSEGV within a few steps (no Python frame,
+        # allocator-config independent); run without AC until torch_npu
+        # resolves it. See NPU_MOONEP_KIMIK3_RUN_DOC.md issue #4.
+        activation_checkpoint=None,
+        # NPU compile-stack workarounds (both verified against the H100 CI
+        # math via the eager composites; see NPU_MOONEP_KIMIK3_RUN_DOC.md):
+        # 1. eager_flex_attention: the class-level compiled FlexAttention
+        #    backward intermittently returns NaN on this stack's inductor
+        #    (observed in the vision encoder, data-dependent).
+        # 2. eager_gated_rmsnorm: the compiled gated_rmsnorm region's
+        #    backward returns ~1e38/NaN values for the norm weight gradient,
+        #    exploding the step through gradient clipping.
+        override=OverrideConfig(
+            imports=[
+                "torchtitan.overrides.eager_flex_attention.eager_flex_attention",
+                "torchtitan.overrides.eager_gated_rmsnorm.eager_gated_rmsnorm",
+            ],
+        ),
     )
 
 

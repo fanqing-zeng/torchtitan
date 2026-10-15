@@ -507,6 +507,7 @@ def _debugmodel(
     attn_backend: str,
     *,
     seq_len: int,
+    num_experts: int = 8,
 ) -> KimiK3Model.Config:
     dim = 256
     return _kimi_k3_config(
@@ -527,7 +528,7 @@ def _debugmodel(
         dense_hidden_dim=512,
         latent_dim=128,
         expert_hidden_dim=128,
-        num_experts=8,
+        num_experts=num_experts,
         top_k=2,
         num_shared_experts=2,
         vision_encoder=_vision_encoder_config(
@@ -542,6 +543,51 @@ def _debugmodel(
         ),
         attn_backend=attn_backend,
     )
+
+
+def _debugmodel_moonep(
+    attn_backend: str,
+    *,
+    seq_len: int,
+) -> KimiK3Model.Config:
+    """Debugmodel with MoonEP-aligned expert blocks for Ascend 950DT.
+
+    MoonEP maps each rank's expert block and its prefetch slots into adjacent
+    virtual addresses for a compact ``[epn+B]`` GEMM view, which requires
+    every VMM chunk to be an exact multiple of the CANN VMM allocation
+    granularity -- 2 MiB on Ascend 950DT, the driver's MINIMUM (verified via
+    ``aclrtMemGetAllocationGranularity``; there is no smaller option). The
+    NPU backend allocates four chunks per projection, all sized by the
+    per-rank expert block with ``prefetch_slots == experts_per_rank``:
+    bf16 home weight and prefetch slots, fp32 home/slot gradients. The
+    binding constraint is the bf16 half-byte width: the down projection
+    (``out x in = 128 x 128``) needs ``E/R`` to be a multiple of 64, gate_up
+    (``256 x 128``) only a multiple of 32. With ``num_experts=8`` the
+    official debugmodel can never satisfy this (MoonEP requires EP > 1, so
+    ``E/R <= 4``). ``num_experts=128`` at the MoonEP recipe's ``ep=2`` gives
+    ``E/R=64``: every chunk is an exact 2 MiB multiple (down: bf16 2 MiB /
+    fp32 4 MiB; gate_up: bf16 4 MiB / fp32 8 MiB). For other EP degrees keep
+    ``E/R`` a multiple of 64: ep=4 -> 256 experts, ep=8 -> 512.
+    """
+    return _debugmodel(attn_backend, seq_len=seq_len, num_experts=128)
+
+
+def _debugmodel_moonep_512(
+    attn_backend: str,
+    *,
+    seq_len: int,
+) -> KimiK3Model.Config:
+    """Debugmodel with MoonEP-aligned expert blocks sized for ep=8.
+
+    Same Ascend 950DT VMM constraint as ``_debugmodel_moonep``: every MoonEP
+    chunk must be an exact multiple of the 2 MiB minimum allocation
+    granularity, and the binding constraint is ``E/R`` a multiple of 64
+    (``num_experts = 64 x ep``). ``num_experts=512`` serves the 8-card
+    recipe's ``ep=8`` (``E/R=64``) and also covers ep=2/4 (``E/R`` = 256/128);
+    the ep=2 recipe keeps its own 128-expert flavor so its validated
+    numerics stay fixed.
+    """
+    return _debugmodel(attn_backend, seq_len=seq_len, num_experts=512)
 
 
 def _kimi_k3(
@@ -587,6 +633,8 @@ def _kimi_k3(
 
 MODEL_FLAVORS = {
     "debugmodel": (_debugmodel, 16384),
+    "debugmodel-moonep": (_debugmodel_moonep, 16384),
+    "debugmodel-moonep-512": (_debugmodel_moonep_512, 16384),
     "Kimi-K3": (_kimi_k3, 262144),
 }
 

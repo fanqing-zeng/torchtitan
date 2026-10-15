@@ -11,15 +11,17 @@ from dataclasses import dataclass
 import spmd_types as spmd
 import torch
 import torch_remat as remat
-from attn_gym.linear._delta_rule.gate import _FusedGate
-from attn_gym.linear.context_parallel import ContextParallelRouting
-from attn_gym.linear.kda import bound_gate, chunk_kda
-from attn_gym.linear.kda.fwd.triton.l2norm_fwd import _L2Norm, l2norm
-from attn_gym.linear.kda.impl.cudnn import ChunkKdaCudnn
-from attn_gym.linear.kda.impl.fused import _ChunkKDA
-from attn_gym.linear.kda.masking import _MaskRows
-from attn_gym.linear.short_conv import causal_conv1d
-from attn_gym.linear.short_conv.cute import _ConfiguredShortConv, _ShortConv
+from typing import TYPE_CHECKING
+
+import torch
+import torch.nn.functional as F
+from torchtitan.models.common.attention.npu_kda import npu_chunk_kda
+from fla.ops.kda.chunk import ChunkKDAFunction
+
+if TYPE_CHECKING:
+    # Type-only: the CP routing type belongs to the CUDA-only context-parallel
+    # path; importing it eagerly would drag its kernels onto every device.
+    from attn_gym.linear.context_parallel import ContextParallelRouting
 from torch import nn
 
 from torchtitan.models.common.linear import Linear, maybe_gather_tp_input
@@ -53,18 +55,60 @@ class LinearAttentionMetadata:
             self.varlen.annotate_spmd_types()
 
 
-# The Attention Gym kernels run on rank-local heads inside InnerKDA's local
-# SPMD region.
-for _kernel_function in (
-    _ShortConv,
-    _ConfiguredShortConv,
-    _FusedGate,
-    _L2Norm,
-    _ChunkKDA,
-    ChunkKdaCudnn,
-    _MaskRows,
-):
-    spmd.register_local_autograd_function(_kernel_function)
+# fla's KDA autograd function runs on rank-local heads inside InnerKDA's
+# local SPMD region. The short convolution below is plain torch ops and is
+# type-checked like any composite.
+spmd.register_local_autograd_function(ChunkKDAFunction)
+
+
+def _l2norm(x: torch.Tensor) -> torch.Tensor:
+    """Per-head L2 normalization over the last dimension (fla's l2norm)."""
+    return x * torch.rsqrt(x.float().pow(2).sum(dim=-1, keepdim=True) + 1e-6).to(x.dtype)
+
+
+def _causal_conv1d_silu(
+    qkv_1TC: torch.Tensor,
+    weight_CW: torch.Tensor,
+    *,
+    cu_seqlens: torch.Tensor | None,
+    initial_state: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Depthwise causal conv1d + SiLU over packed documents, in plain torch.
+
+    ``qkv_1TC`` is ``[1, T, C]`` and ``weight_CW`` is ``[C, W]`` (one W-tap
+    filter per channel). With ``cu_seqlens`` each document convolves
+    independently: taps reaching past the document start contribute zero,
+    which is the varlen semantics of the previous short-conv kernel.
+    ``initial_state`` is unsupported (the local path never seeds a state).
+    """
+    if initial_state is not None:
+        raise NotImplementedError(
+            "KDA short convolution does not support an initial state on this "
+            "path."
+        )
+    x_TC = qkv_1TC.squeeze(0)
+    seq_len, num_channels = x_TC.shape
+    kernel_size = weight_CW.shape[-1]
+    device = x_TC.device
+
+    token_index = torch.arange(seq_len, device=device)
+    if cu_seqlens is not None:
+        # cu_seqlens = [0, end(doc0), ..., T]; each token's document starts at
+        # the cu entry selected by counting how many document ends are <= t.
+        doc_ids = torch.searchsorted(cu_seqlens[1:], token_index, right=True)
+        doc_start = cu_seqlens[doc_ids].to(token_index.dtype)
+    else:
+        doc_start = torch.zeros(seq_len, device=device, dtype=token_index.dtype)
+
+    out_TC = torch.zeros_like(x_TC)
+    for tap in range(kernel_size):
+        source = token_index - tap
+        valid = source >= doc_start
+        gathered = x_TC[source.clamp_min(0)] * valid.unsqueeze(-1).to(x_TC.dtype)
+        # F.conv1d is cross-correlation: weight index k sees the tap at
+        # distance (kernel_size - 1 - k).
+        out_TC = out_TC + gathered * weight_CW[:, kernel_size - 1 - tap].unsqueeze(0).to(x_TC.dtype)
+    return F.silu(out_TC).unsqueeze(0)
 
 
 class KDAKernel(Module):
@@ -97,22 +141,25 @@ class KDAKernel(Module):
         *,
         cu_seqlens: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        q_1THK, k_1THK, gate_1THK, beta_1TH = self.prepare_inputs(
-            q_1THK,
-            k_1THK,
-            raw_gate_1THK,
-            raw_beta_1TH,
-            A_log_H,
-            dt_bias_HK,
-        )
-        output_1THV, _ = chunk_kda(
+        # ``npu_chunk_kda`` falls through to fla's chunked KDA kernel for
+        # head_dim < 128 and takes over with fla_npu's fused ascendc kernels
+        # at head_dim >= 128, where FLA's triton kernels deadlock on NPU.
+        # fla_npu is imported lazily inside the wrapper, so environments
+        # without the package keep the FLA path.
+        output_1THV, _ = npu_chunk_kda(
             q_1THK,
             k_1THK,
             v_1THV,
-            gate_1THK,
-            beta_1TH,
+            raw_gate_1THK,
+            raw_beta_1TH,
+            A_log=A_log_H,
+            dt_bias=dt_bias_HK.reshape(-1),
+            use_qk_l2norm_in_kernel=True,
+            use_gate_in_kernel=True,
+            use_beta_sigmoid_in_kernel=True,
+            safe_gate=self.lower_bound is not None,
+            lower_bound=self.lower_bound,
             cu_seqlens=cu_seqlens,
-            autotune=not torch.are_deterministic_algorithms_enabled(),
         )
         return output_1THV
 
@@ -125,22 +172,20 @@ class KDAKernel(Module):
         A_log_H: torch.Tensor,
         dt_bias_HK: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Apply the preprocessing shared by local and CP KDA cores."""
-        if not q_1THK.is_cuda:
-            raise RuntimeError("Attention Gym KDA requires CUDA tensors.")
+        """Eager preprocessing shared by local and CP KDA cores.
 
-        gate_1THK = bound_gate(
-            raw_gate_1THK,
-            # TODO: The long-term solution is to specify mixed precision per FQN
-            # instead of per layer. https://github.com/pytorch/pytorch/issues/156784
-            A_log_H.float(),
-            dt_bias_HK.float(),
-            lower_bound=self.lower_bound,
-            impl="fused",
+        ``lower_bound * sigmoid(exp(A_log) * (raw_gate + dt_bias))`` in FP32 is
+        the bounded gate transform; the Q/K L2 norm is the standard per-head
+        normalization. The local (fla) path folds both into its kernel; this
+        composite stays for the context-parallel core.
+        """
+        gate_1THK = self.lower_bound * torch.sigmoid(
+            torch.exp(A_log_H.float()).unsqueeze(-1).unsqueeze(0)
+            * (raw_gate_1THK.float() + dt_bias_HK.float())
         )
         return (
-            l2norm(q_1THK),
-            l2norm(k_1THK),
+            _l2norm(q_1THK),
+            _l2norm(k_1THK),
             gate_1THK,
             raw_beta_1TH.float().sigmoid(),
         )
@@ -156,9 +201,10 @@ class InnerKDA(InnerAttention):
         kernel: KDAKernel.Config
 
         def __post_init__(self):
-            if self.head_dim != 128:
+            if self.head_dim not in (64, 128):
                 raise ValueError(
-                    "Attention Gym KDA requires head_dim=128, " f"got {self.head_dim}."
+                    "KDA supports head_dim 64 or 128 (the fla kernel path), "
+                    f"got {self.head_dim}."
                 )
 
         def build_attention_metadata(
@@ -231,7 +277,7 @@ class InnerKDA(InnerAttention):
         dt_bias_HK: torch.Tensor,
         *,
         cu_seqlens: torch.Tensor | None,
-        routing: ContextParallelRouting | None,
+        routing: "ContextParallelRouting | None",
     ) -> torch.Tensor:
         """Run the stages shared by local and context-parallel KDA."""
         raw_gate_1THK = raw_gate_THK.unsqueeze(0)
@@ -276,13 +322,12 @@ class InnerKDA(InnerAttention):
         initial_state: torch.Tensor | None = None,
         *,
         cu_seqlens: torch.Tensor | None,
-        routing: ContextParallelRouting | None,
+        routing: "ContextParallelRouting | None",
     ) -> torch.Tensor:
         del routing
-        output_1TC = causal_conv1d(
+        output_1TC = _causal_conv1d_silu(
             qkv_1TC,
             conv_weight_C1W[:, 0],
-            activation="silu",
             cu_seqlens=cu_seqlens,
             initial_state=initial_state,
         )
@@ -300,7 +345,7 @@ class InnerKDA(InnerAttention):
         dt_bias_HK: torch.Tensor,
         *,
         cu_seqlens: torch.Tensor | None,
-        routing: ContextParallelRouting | None,
+        routing: "ContextParallelRouting | None",
     ) -> torch.Tensor:
         del routing
         return self.kernel(
@@ -340,9 +385,15 @@ class KDA(Module):
         def __post_init__(self):
             if self.num_heads < 1:
                 raise ValueError(f"num_heads must be positive, got {self.num_heads}")
-            if self.head_dim != 128:
+            # head_dim 64 runs fla's triton-ascend kernel via the npu_chunk_kda
+            # fall-through; head_dim 128 (the released topology) is taken over
+            # by fla_npu's fused ascendc kernels inside npu_chunk_kda, because
+            # fla's triton kernel hangs at 128 on this stack.
+            if self.head_dim not in (64, 128):
                 raise ValueError(
-                    "Attention Gym KDA requires head_dim=128, " f"got {self.head_dim}."
+                    "KDA head_dim must be 64 or 128 "
+                    f"(the fla/triton-ascend kernel hangs at 128, which "
+                    f"npu_chunk_kda takes over), got {self.head_dim}."
                 )
             if self.conv_kernel_size < 1:
                 raise ValueError(

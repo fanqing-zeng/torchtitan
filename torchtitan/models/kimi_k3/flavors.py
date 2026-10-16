@@ -9,6 +9,7 @@
 from collections.abc import Callable
 from dataclasses import replace
 from functools import partial
+from typing import Literal
 
 import torch
 import torch.nn as nn
@@ -54,6 +55,7 @@ __all__ = [
     "KimiK3VisionEncoder",
     "MODEL_FLAVORS",
     "build_model_config",
+    "configure_fused_ops",
 ]
 
 
@@ -639,12 +641,58 @@ MODEL_FLAVORS = {
 }
 
 
+def configure_fused_ops(
+    config: KimiK3Model.Config,
+    *,
+    situ_glu: Literal["eager", "ascendc"] = "ascendc",
+    rms_norm: Literal["eager", "ascendc"] = "ascendc",
+    gated_rms_norm: Literal["eager", "fla"] = "fla",
+    causal_conv1d: Literal["eager", "ascendc"] = "ascendc",
+    kda: Literal["auto", "ascendc", "fla"] = "auto",
+    attn_res: Literal["eager", "triton", "fla"] = "triton",
+) -> KimiK3Model.Config:
+    """Select Kimi K3's NPU kernels before model construction and converters.
+
+    Non-NPU execution retains the existing torch implementations (and FLA
+    KDA). Each selection is explicit so recipes can compare one operator at
+    a time. Parameter shapes and checkpoint ownership are unaffected.
+    """
+    choices = {
+        "situ_glu": (situ_glu, ("eager", "ascendc")),
+        "rms_norm": (rms_norm, ("eager", "ascendc")),
+        "gated_rms_norm": (gated_rms_norm, ("eager", "fla")),
+        "causal_conv1d": (causal_conv1d, ("eager", "ascendc")),
+        "kda": (kda, ("auto", "ascendc", "fla")),
+        "attn_res": (attn_res, ("eager", "triton", "fla")),
+    }
+    for name, (value, supported) in choices.items():
+        if value not in supported:
+            raise ValueError(
+                f"Unsupported {name} implementation {value!r}; expected {supported}."
+            )
+    config.attn_res_implementation = attn_res
+    for layer in config.layers:
+        layer.attn_res_implementation = attn_res
+    for _, norm, _, _ in config.traverse(RMSNorm.Config):
+        norm.implementation = rms_norm
+    for _, activation, _, _ in config.traverse(SiTUGLU.Config):
+        activation.implementation = situ_glu
+    for _, gated_norm, _, _ in config.traverse(GatedRMSNorm.Config):
+        gated_norm.implementation = gated_rms_norm
+    for _, inner, _, _ in config.traverse(InnerKDA.Config):
+        inner.conv_implementation = causal_conv1d
+    for _, kernel, _, _ in config.traverse(KDAKernel.Config):
+        kernel.implementation = kda
+    return config
+
+
 def build_model_config(
     flavor: str,
     attn_backend: str = "flex",
     converters: list[ModelConfigConverter.Config] | None = None,
     *,
     seq_len: int | None = None,
+    use_npu_fused_ops: bool = True,
 ) -> KimiK3Model.Config:
     get_config, max_context_len = MODEL_FLAVORS[flavor]
     context_len = seq_len or max_context_len
@@ -657,6 +705,8 @@ def build_model_config(
         attn_backend=attn_backend,
         seq_len=context_len,
     )
+    if use_npu_fused_ops:
+        configure_fused_ops(config)
     if converters is not None:
         validate_converter_compatibility(converters)
         for converter in converters:

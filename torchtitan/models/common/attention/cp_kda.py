@@ -119,6 +119,14 @@ class ContextParallelInnerKDA(
         *,
         attention_metadata: LinearAttentionMetadata | None,
     ) -> torch.Tensor:
+        if query_TC.device.type == "npu" and self.kernel.implementation in (
+            "auto",
+            "ascendc",
+        ):
+            raise NotImplementedError(
+                "AscendC KDA does not support the recurrent-state gradients "
+                "required by context parallelism. Use context_parallel_degree=1."
+            )
         if not isinstance(attention_metadata, ContextParallelLinearAttentionMetadata):
             raise ValueError(
                 "KDA context parallelism requires rank-local attention metadata."

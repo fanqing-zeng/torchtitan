@@ -59,7 +59,7 @@ version = {file = "assets/version.txt"}
 
 [tool.codespell]
 skip = ["*.json"]
-ignore-words-list = ["assertin", "datas" ,"indx", "inpt", "nd", "socio-economic"]
+ignore-words-list = ["assertin", "cann", "datas" ,"indx", "inpt", "nd", "socio-economic"]
 
 # ---- Explicit project build information ---- #
 [build-system]
@@ -86,6 +86,8 @@ replace-imports-with-any = [
     "torchao.*", "torchft", "torchvision.*", "deep_ep.*", "jinja2.*", "helion", "helion.*", "batch_invariant_ops", "verifiers.*", # optional dependencies
     "dist_moe", "dist_moe.*", # optional dependency without Pyrefly stubs
     "torch_npu", "torch_npu.*", "ascend_moonep", "ascend_moonep.*", # npu extra, no Pyrefly stubs
+    "cann_ops_nn", "cann_ops_nn.*", "fla", "fla.*", "fla_npu", "fla_npu.*", # optional NPU kernels
+    "triton", "triton.*", # optional Triton-Ascend kernels
     # torch_remat is required, but does not publish Pyrefly stubs.
     "torch_remat",
 ]

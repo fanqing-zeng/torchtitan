@@ -7,16 +7,12 @@
 """Kimi Delta Attention using Attention Gym kernels."""
 
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import spmd_types as spmd
 import torch
-import torch_remat as remat
-from typing import TYPE_CHECKING
-
-import torch
 import torch.nn.functional as F
-from torchtitan.models.common.attention.npu_kda import npu_chunk_kda
-from fla.ops.kda.chunk import ChunkKDAFunction
+import torch_remat as remat
 
 if TYPE_CHECKING:
     # Type-only: the CP routing type belongs to the CUDA-only context-parallel
@@ -35,6 +31,8 @@ from .attention import (
     local_head_split,
     VarlenAttentionMetadata,
 )
+from .npu_causal_conv1d import _AscendCCausalConv1d, ascendc_causal_conv1d
+from .npu_kda import _NPUKDA, npu_chunk_kda
 
 # Shape suffixes:
 # T = packed tokens, D = model dimension, C = projection channels,
@@ -55,15 +53,16 @@ class LinearAttentionMetadata:
             self.varlen.annotate_spmd_types()
 
 
-# fla's KDA autograd function runs on rank-local heads inside InnerKDA's
-# local SPMD region. The short convolution below is plain torch ops and is
-# type-checked like any composite.
-spmd.register_local_autograd_function(ChunkKDAFunction)
+# These kernels run on rank-local heads inside InnerKDA's local SPMD region.
+spmd.register_local_autograd_function(_NPUKDA)
+spmd.register_local_autograd_function(_AscendCCausalConv1d)
 
 
 def _l2norm(x: torch.Tensor) -> torch.Tensor:
     """Per-head L2 normalization over the last dimension (fla's l2norm)."""
-    return x * torch.rsqrt(x.float().pow(2).sum(dim=-1, keepdim=True) + 1e-6).to(x.dtype)
+    return x * torch.rsqrt(x.float().pow(2).sum(dim=-1, keepdim=True) + 1e-6).to(
+        x.dtype
+    )
 
 
 def _causal_conv1d_silu(
@@ -83,8 +82,7 @@ def _causal_conv1d_silu(
     """
     if initial_state is not None:
         raise NotImplementedError(
-            "KDA short convolution does not support an initial state on this "
-            "path."
+            "KDA short convolution does not support an initial state on this " "path."
         )
     x_TC = qkv_1TC.squeeze(0)
     seq_len, num_channels = x_TC.shape
@@ -107,7 +105,9 @@ def _causal_conv1d_silu(
         gathered = x_TC[source.clamp_min(0)] * valid.unsqueeze(-1).to(x_TC.dtype)
         # F.conv1d is cross-correlation: weight index k sees the tap at
         # distance (kernel_size - 1 - k).
-        out_TC = out_TC + gathered * weight_CW[:, kernel_size - 1 - tap].unsqueeze(0).to(x_TC.dtype)
+        out_TC = out_TC + gathered * weight_CW[:, kernel_size - 1 - tap].unsqueeze(
+            0
+        ).to(x_TC.dtype)
     return F.silu(out_TC).unsqueeze(0)
 
 
@@ -117,8 +117,11 @@ class KDAKernel(Module):
     @dataclass(kw_only=True, slots=True)
     class Config(Module.Config):
         lower_bound: float = -5.0
+        implementation: str = "auto"
 
         def __post_init__(self):
+            if self.implementation not in ("auto", "ascendc", "fla"):
+                raise ValueError("KDA implementation must be auto, ascendc, or fla.")
             if not -5.0 <= self.lower_bound < 0.0:
                 raise ValueError(
                     "KDA lower_bound must be in the safe range [-5, 0), "
@@ -128,6 +131,7 @@ class KDAKernel(Module):
     def __init__(self, config: Config):
         super().__init__()
         self.lower_bound = config.lower_bound
+        self.implementation = config.implementation
 
     def forward(
         self,
@@ -141,11 +145,6 @@ class KDAKernel(Module):
         *,
         cu_seqlens: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        # ``npu_chunk_kda`` falls through to fla's chunked KDA kernel for
-        # head_dim < 128 and takes over with fla_npu's fused ascendc kernels
-        # at head_dim >= 128, where FLA's triton kernels deadlock on NPU.
-        # fla_npu is imported lazily inside the wrapper, so environments
-        # without the package keep the FLA path.
         output_1THV, _ = npu_chunk_kda(
             q_1THK,
             k_1THK,
@@ -160,6 +159,7 @@ class KDAKernel(Module):
             safe_gate=self.lower_bound is not None,
             lower_bound=self.lower_bound,
             cu_seqlens=cu_seqlens,
+            backend=self.implementation,
         )
         return output_1THV
 
@@ -199,8 +199,13 @@ class InnerKDA(InnerAttention):
         head_dim: int
         conv_kernel_size: int
         kernel: KDAKernel.Config
+        conv_implementation: str = "eager"
 
         def __post_init__(self):
+            if self.conv_implementation not in ("eager", "ascendc"):
+                raise ValueError(
+                    "KDA convolution implementation must be eager or ascendc."
+                )
             if self.head_dim not in (64, 128):
                 raise ValueError(
                     "KDA supports head_dim 64 or 128 (the fla kernel path), "
@@ -230,6 +235,7 @@ class InnerKDA(InnerAttention):
         super().__init__()
         self.head_dim = config.head_dim
         self.kernel = config.kernel.build()
+        self.conv_implementation = config.conv_implementation
 
     def forward(
         self,
@@ -325,6 +331,14 @@ class InnerKDA(InnerAttention):
         routing: "ContextParallelRouting | None",
     ) -> torch.Tensor:
         del routing
+        if self.conv_implementation == "ascendc" and qkv_1TC.device.type == "npu":
+            return ascendc_causal_conv1d(
+                qkv_1TC,
+                conv_weight_C1W[:, 0],
+                num_heads=qkv_1TC.shape[-1] // self.head_dim,
+                cu_seqlens=cu_seqlens,
+                initial_state=initial_state,
+            )
         output_1TC = _causal_conv1d_silu(
             qkv_1TC,
             conv_weight_C1W[:, 0],

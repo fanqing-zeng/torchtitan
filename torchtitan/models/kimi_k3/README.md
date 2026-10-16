@@ -11,9 +11,13 @@ Install the additional dependencies:
 pip install -r .ci/docker/requirements-vlm.txt
 ```
 
-KDA uses Attention Gym kernels, which need an NVIDIA GPU with CUDA capability
-9.0 or newer. Attention Gym runs its CuTe kernels on SM100/SM103 and its Triton
-kernels on other GPUs.
+Ascend NPU training uses the fused operators described in
+[NPU fused operators](NPU_FUSED_OPS.md), including dependency contracts,
+implementation switches and CPU/NPU test commands. AscendC KDA currently requires
+context parallel degree 1.
+
+The existing CUDA paths use FLA for local KDA and Attention Gym for context
+parallel KDA; their accelerator dependencies must be installed separately.
 
 ## Architecture
 

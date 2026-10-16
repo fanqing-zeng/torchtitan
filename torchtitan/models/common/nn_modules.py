@@ -17,10 +17,48 @@ add more if a new callsite needs them.
 """
 
 from dataclasses import dataclass
+from typing import Literal
 
+import spmd_types as spmd
+
+import torch
 import torch.nn as nn
+import torch.nn.functional as F
+from torch.autograd.function import once_differentiable
 
 from torchtitan.protocols.module import Module
+
+# Shape suffixes: D = normalized feature dimension, R = per-row RMS statistics.
+
+
+class _AscendCRMSNorm(torch.autograd.Function):
+    """Expose the fused forward/backward pair to the SPMD type checker."""
+
+    @staticmethod
+    def forward(  # pyrefly: ignore[bad-override]
+        ctx, x_D: torch.Tensor, weight_D: torch.Tensor, eps: float
+    ):
+        import torch_npu
+
+        output_D, rstd_R = torch_npu.npu_rms_norm(x_D, weight_D, epsilon=eps)
+        ctx.save_for_backward(x_D, weight_D, rstd_R)
+        return output_D
+
+    @staticmethod
+    @once_differentiable
+    def backward(ctx, grad_output_D: torch.Tensor):  # pyrefly: ignore[bad-override]
+        x_D, weight_D, rstd_R = ctx.saved_tensors
+        grad_x_D, grad_weight_D = torch.ops.npu.npu_rms_norm_backward(
+            grad_output_D.contiguous(), x_D, weight_D, rstd_R
+        )
+        return grad_x_D, grad_weight_D, None
+
+
+@spmd.register_decomposition(_AscendCRMSNorm)
+def _rms_norm_reference(
+    x_D: torch.Tensor, weight_D: torch.Tensor, eps: float
+) -> torch.Tensor:
+    return F.rms_norm(x_D, weight_D.shape, weight_D, eps)
 
 
 class Conv1d(nn.Conv1d, Module):
@@ -132,13 +170,20 @@ class LayerNorm(nn.LayerNorm, Module):
 
 
 class RMSNorm(nn.RMSNorm, Module):
-    """Configurable nn.RMSNorm."""
+    """Configurable RMSNorm with an optional torch_npu AscendC kernel on NPU."""
 
     @dataclass(kw_only=True, slots=True)
     class Config(Module.Config):
         normalized_shape: int
         eps: float = 1e-5
         elementwise_affine: bool = True
+        implementation: Literal["eager", "ascendc"] = "eager"
+
+        def __post_init__(self) -> None:
+            if self.implementation not in ("eager", "ascendc"):
+                raise ValueError(
+                    f"Unsupported RMSNorm implementation: {self.implementation}"
+                )
 
     def __init__(self, config: Config):
         super().__init__(
@@ -146,6 +191,21 @@ class RMSNorm(nn.RMSNorm, Module):
             eps=config.eps,
             elementwise_affine=config.elementwise_affine,
         )
+        self.implementation = config.implementation
+
+    def forward(  # pyrefly: ignore[bad-param-name-override]
+        self, input: torch.Tensor
+    ) -> torch.Tensor:
+        # Preserve nn.RMSNorm's argument name used by norm sharding configs.
+        # D denotes the normalized feature dimension.
+        x_D = input
+        if self.implementation == "ascendc" and x_D.device.type == "npu":
+            weight_D = self.weight
+            if weight_D is None:
+                weight_D = x_D.new_ones(self.normalized_shape)
+            eps = torch.finfo(x_D.dtype).eps if self.eps is None else self.eps
+            return _AscendCRMSNorm.apply(x_D, weight_D, eps)
+        return super().forward(x_D)
 
 
 __all__ = [

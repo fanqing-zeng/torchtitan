@@ -6,6 +6,7 @@
 
 from .flavors import (
     build_model_config,
+    configure_fused_ops,
     KIMI_K3_SPECIAL_TOKENS,
     KimiK3Model,
     KimiK3VisionEncoder,
@@ -18,4 +19,5 @@ __all__ = [
     "KimiK3VisionEncoder",
     "MODEL_FLAVORS",
     "build_model_config",
+    "configure_fused_ops",
 ]
